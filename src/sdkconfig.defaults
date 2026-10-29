@@ -1,0 +1,60 @@
+# Optimize for performance
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# WiFi and lwIP IRAM optimization (avoids flash cache misses during packet processing)
+CONFIG_ESP_WIFI_IRAM_OPT=y
+CONFIG_ESP_WIFI_RX_IRAM_OPT=y
+CONFIG_LWIP_IRAM_OPTIMIZATION=y
+
+# Reduce bootloader log verbosity
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_BOOTLOADER_LOG_LEVEL=2
+
+# assert() aborts without the __FILE__/expression strings
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTION_LEVEL=1
+
+# esp_err_to_name() returns the numeric code instead of carrying the full
+# error-string table
+CONFIG_ESP_ERR_TO_NAME_LOOKUP=n
+
+# Increase main task stack size
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=7168
+
+# Default event loop task (sys_evt): every ESP_LOG in an event handler runs the
+# full newlib vfprintf (~800 bytes frame), plus the syslog vprintf hook (~400 bytes
+# + a second format pass) when syslog is enabled. The 2304-byte default overflowed
+# on the ESP32-S3; the margin on the other targets is equally thin.
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+# Flash size
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Enable filesystem
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_example.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_example.csv"
+
+# Enable FreeRTOS stats formatting functions, needed for 'tasks' command
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+
+# LWIP
+CONFIG_LWIP_L2_TO_L3_COPY=y
+CONFIG_LWIP_IP_FORWARD=y  
+CONFIG_LWIP_IPV4_NAPT=y
+
+# DHCP server
+CONFIG_LWIP_DHCPS_MAX_STATION_NUM=16
+
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Wi-Fi
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=48
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=48
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
+CONFIG_ESP_WIFI_TX_BA_WIN=32
+
+# OTA
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

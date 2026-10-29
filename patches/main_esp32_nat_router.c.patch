@@ -1,0 +1,37 @@
+diff --git a/prist2/esp32_nat_router-master/main/esp32_nat_router.c b/esp32-campus-nat/src/main/esp32_nat_router.c
+index 31732eb..0bcc350 100644
+--- a/prist2/esp32_nat_router-master/main/esp32_nat_router.c
++++ b/esp32-campus-nat/src/main/esp32_nat_router.c
+@@ -65,6 +65,7 @@
+ #include "client_stats.h"
+ #include "pcap_capture.h"
+ #include "remote_console.h"
++#include "portal_login.h"
+ #include "syslog_client.h"
+ #include "oled_display.h"
+ #include "led_strip_status.h"
+@@ -1148,6 +1149,13 @@ void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, c
+ 
+     ESP_ERROR_CHECK(esp_wifi_start());
+ 
++    /* Disable WiFi power save. In AP+STA NAT routing the default modem sleep
++     * puts the radio to sleep between beacons: downlink packets for our AP
++     * clients then queue up until the next wake-up, which caps throughput
++     * (measured ~2.6 Mbps with sleep on) and adds latency jitter. A router
++     * must keep its radio awake. */
++    esp_wifi_set_ps(WIFI_PS_NONE);
++
+     if (strlen(ssid) > 0) {
+         ESP_LOGI(TAG, "wifi_init_apsta finished.");
+         ESP_LOGI(TAG, "connect to ap SSID: %s ", ssid);
+@@ -1704,6 +1712,10 @@ void app_main(void)
+     // Initialize remote console (TCP server on port 2323, disabled by default)
+     remote_console_init();
+ 
++    // Initialize uplink captive-portal auto-login (ePortal / Dr.COM).
++    // Disabled until credentials are entered on the /portal page.
++    portal_init();
++
+     // Initialize syslog client (UDP forwarding, disabled by default)
+     syslog_init();
+ 

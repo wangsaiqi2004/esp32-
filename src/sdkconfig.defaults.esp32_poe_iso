@@ -1,0 +1,10 @@
+# Olimex ESP32-POE-ISO Ethernet uplink variant
+# Use with: idf.py -B build_poe_iso -D SDKCONFIG="sdkconfig.poe_iso" -D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.eth_common;sdkconfig.defaults.esp32_poe_iso' build
+
+# Board-specific PHY wiring; MDC/MDIO and the EMAC driver come from eth_common
+CONFIG_ETH_PHY_ADDR=0
+CONFIG_ETH_PHY_POWER_GPIO=12
+
+# RMII clock: ESP32 drives 50MHz clock output on GPIO17 (LAN8720 receives it)
+CONFIG_ETH_RMII_CLK_OUTPUT=y
+CONFIG_ETH_RMII_CLK_OUT_GPIO=17

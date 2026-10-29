@@ -1,0 +1,5 @@
+.pio/
+managed_components/
+build.log
+sdkconfig.old
+*.bin.bak

@@ -1,0 +1,6 @@
+dependencies:
+  espressif/led_strip: '*'
+  espressif/mdns:
+    version: '*'
+    rules:
+      - if: "idf_target != \"esp32c5\""

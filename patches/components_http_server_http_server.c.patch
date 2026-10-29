@@ -1,0 +1,294 @@
+diff --git a/prist2/esp32_nat_router-master/components/http_server/http_server.c b/esp32-campus-nat/src/components/http_server/http_server.c
+index 1456850..2a5a6db 100644
+--- a/prist2/esp32_nat_router-master/components/http_server/http_server.c
++++ b/esp32-campus-nat/src/components/http_server/http_server.c
+@@ -13,6 +13,7 @@
+  */
+ #include <stdlib.h>
+ #include <string.h>
++#include <ctype.h>
+ #include "driver/gpio.h"
+ #include "esp_netif.h"
+ #include "lwip/ip_addr.h"
+@@ -44,6 +45,7 @@
+ #include "acl.h"
+ #include "remote_console.h"
+ #include "cJSON.h"
++#include "portal_login.h"
+ #include "esp_ota_ops.h"
+ #include "esp_app_format.h"
+ #include "esp_app_desc.h"
+@@ -2308,6 +2310,163 @@ static esp_err_t config_get_handler(httpd_req_t *req)
+     return ESP_OK;
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * Uplink captive-portal auto-login page (ePortal / Dr.COM).
++ * Kept self-contained: no shared page templates, so it cannot disturb the
++ * positional %s substitution used by the larger pages.
++ * ------------------------------------------------------------------------- */
++
++static void form_decode(const char *src, char *dst, size_t len)
++{
++    size_t o = 0;
++    for (size_t i = 0; src[i] && o + 1 < len; i++) {
++        if (src[i] == '%' && isxdigit((unsigned char)src[i + 1]) &&
++            isxdigit((unsigned char)src[i + 2])) {
++            char hex[3] = { src[i + 1], src[i + 2], '\0' };
++            dst[o++] = (char)strtol(hex, NULL, 16);
++            i += 2;
++        } else if (src[i] == '+') {
++            dst[o++] = ' ';
++        } else {
++            dst[o++] = src[i];
++        }
++    }
++    dst[o] = '\0';
++}
++
++static bool form_get(const char *body, const char *key, char *out, size_t len)
++{
++    size_t klen = strlen(key);
++    const char *p = body;
++    while (p && *p) {
++        if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
++            const char *v = p + klen + 1;
++            const char *end = strchr(v, '&');
++            size_t n = end ? (size_t)(end - v) : strlen(v);
++            char tmp[256];
++            if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
++            memcpy(tmp, v, n);
++            tmp[n] = '\0';
++            form_decode(tmp, out, len);
++            return true;
++        }
++        p = strchr(p, '&');
++        if (p) p++;
++    }
++    return false;
++}
++
++static const char PORTAL_HEAD[] =
++    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
++    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
++    "<title>Campus Portal Login</title><style>"
++    "body{font-family:system-ui,Arial,sans-serif;background:#0f1620;color:#e6edf3;margin:0;padding:1.2rem}"
++    "h2{font-size:1.05rem;margin:.2rem 0 1rem;color:#7cc4ff}"
++    "table{width:100%;border-collapse:collapse}td{padding:.45rem .3rem;font-size:.92rem}"
++    "input[type=text],input[type=password],input[type=number]{width:100%;padding:.5rem;"
++    "border-radius:6px;border:1px solid #2b3a4a;background:#16202b;color:#e6edf3;box-sizing:border-box}"
++    ".ok{background:#187a3c;color:#fff;border:0;border-radius:8px;padding:.8rem 1.2rem;"
++    "font-size:1rem;font-weight:600;width:100%}"
++    ".st{background:#16202b;border-left:3px solid #7cc4ff;padding:.6rem;border-radius:6px;"
++    "font-size:.8rem;word-break:break-all;margin-bottom:1rem;color:#9fb3c8}"
++    "a{color:#7cc4ff}small{color:#8b9bb0}"
++    "</style></head><body><h2>Uplink Portal Auto-Login</h2>";
++
++static esp_err_t portal_get_handler(httpd_req_t *req)
++{
++    /* Password protection, same policy as the other config pages. */
++    if (is_web_password_set() && !is_authenticated(req)) {
++        httpd_resp_set_status(req, "303 See Other");
++        httpd_resp_set_hdr(req, "Location", "/?auth_required=1");
++        httpd_resp_send(req, NULL, 0);
++        return ESP_OK;
++    }
++
++    char url[192] = "", user[64] = "", pass[64] = "";
++    int en = 0, iv = 240;
++    portal_config_get(url, sizeof(url), user, sizeof(user), pass, sizeof(pass), &en, &iv);
++
++    char status[192];
++    portal_status_text(status, sizeof(status));
++
++    /* url(192) + user(64) + status(192) + ~700 bytes of markup: keep it roomy
++     * so the compiler can prove there is no truncation. */
++    char row[2048];
++    snprintf(row, sizeof(row),
++        "<div class='st'>%s</div>"
++        "<form action='/portal' method='post'><table>"
++        "<tr><td style='width:44%%'>Enable auto-login</td>"
++        "<td><input type='checkbox' name='en' value='1' %s></td></tr>"
++        "<tr><td>Login URL base</td><td><input type='text' name='url' value='%s'></td></tr>"
++        "<tr><td>Username / student ID</td><td><input type='text' name='user' value='%s'></td></tr>"
++        "<tr><td>Password</td><td><input type='password' name='pass' value='' placeholder='%s'></td></tr>"
++        "<tr><td>Keepalive (sec)</td><td><input type='number' name='iv' value='%d' min='60' max='1800'></td></tr>"
++        "<tr><td></td><td><input type='submit' value='Save' class='ok'></td></tr>"
++        "</table></form>"
++        "<p><small>Checks real internet reachability and re-logs in when the uplink "
++        "session expires. Password is stored in NVS on the device.</small></p>"
++        "<p><a href='/'>Back to home</a></p>",
++        status, en ? "checked" : "", url, user,
++        pass[0] ? "saved - leave blank to keep" : "not set yet", iv);
++
++    httpd_resp_set_type(req, "text/html");
++    SEND_CHUNK(req, PORTAL_HEAD, HTTPD_RESP_USE_STRLEN);
++    SEND_CHUNK(req, row, HTTPD_RESP_USE_STRLEN);
++    SEND_CHUNK(req, NULL, 0);
++    return ESP_OK;
++}
++
++static esp_err_t portal_post_handler(httpd_req_t *req)
++{
++    if (is_web_password_set() && !is_authenticated(req)) {
++        httpd_resp_set_status(req, "303 See Other");
++        httpd_resp_set_hdr(req, "Location", "/?auth_required=1");
++        httpd_resp_send(req, NULL, 0);
++        return ESP_OK;
++    }
++
++    char body[512];
++    int total = 0, r;
++    while (total < (int)sizeof(body) - 1 &&
++           (r = httpd_req_recv(req, body + total, sizeof(body) - 1 - total)) > 0) {
++        total += r;
++    }
++    body[total] = '\0';
++
++    char en_s[8] = "", url[192] = "", user[64] = "", pass[64] = "", iv_s[8] = "";
++    form_get(body, "en", en_s, sizeof(en_s));
++    bool has_url  = form_get(body, "url", url, sizeof(url));
++    bool has_user = form_get(body, "user", user, sizeof(user));
++    bool has_pass = form_get(body, "pass", pass, sizeof(pass));
++    bool has_iv   = form_get(body, "iv", iv_s, sizeof(iv_s));
++
++    int en = (strcmp(en_s, "1") == 0) ? 1 : 0;
++    int iv = has_iv ? atoi(iv_s) : 240;
++
++    /* An empty password field means "keep the stored one". */
++    portal_config_set(has_url ? url : NULL,
++                      has_user ? user : NULL,
++                      (has_pass && pass[0] != '\0') ? pass : NULL,
++                      en, iv);
++
++    httpd_resp_set_status(req, "303 See Other");
++    httpd_resp_set_hdr(req, "Location", "/portal");
++    httpd_resp_send(req, NULL, 0);
++    return ESP_OK;
++}
++
++static httpd_uri_t portalp = {
++    .uri       = "/portal",
++    .method    = HTTP_GET,
++    .handler   = portal_get_handler,
++};
++
++static httpd_uri_t portalp_post = {
++    .uri       = "/portal",
++    .method    = HTTP_POST,
++    .handler   = portal_post_handler,
++};
++
+ static httpd_uri_t configp = {
+     .uri       = "/config",
+     .method    = HTTP_GET,
+@@ -3235,7 +3394,7 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
+         if (err == ESP_OK || err == ESP_ERR_WIFI_STATE) {
+             /* No previous results, scan just started */
+             scan_in_progress = true;
+-            refresh_time = 2;  /* Quick refresh to get results */
++            refresh_time = 5;  /* Quick refresh to get results */
+         }
+     }
+ 
+@@ -3245,24 +3404,35 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
+         strcpy(header_extra, "<th>Action</th>");
+     }
+ 
+-    /* Build scan results HTML */
+-    char scan_html[4096] = "";
+-    int html_offset = 0;
++    /* Build scan results HTML.
++     * Each result row (SSID + 4 signal-bar spans + dBm + channel + auth mode +
++     * connect button) reaches ~700 bytes. A fixed 4 KB stack buffer overflowed
++     * at ~20 APs, corrupting the httpd task stack and killing the whole web
++     * server after visiting /scan. Size it from the AP count on the heap. */
++    size_t scan_html_size = 1024 + (size_t)ap_count * 768;
++    char *scan_html = malloc(scan_html_size);
++    if (scan_html == NULL) {
++        ESP_LOGE(TAG, "Failed to allocate memory for scan table");
++        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
++        return ESP_ERR_NO_MEM;
++    }
++    scan_html[0] = '\0';
++    size_t html_offset = 0;
+ 
+     if (ap_count == 0) {
+         if (scan_in_progress) {
+-            snprintf(scan_html, sizeof(scan_html),
++            snprintf(scan_html, scan_html_size,
+                 "<tr><td colspan='%d' style='text-align:center; color:#00d9ff;'>"
+                 "<span style='display:inline-block; animation: pulse 1s infinite;'>📡 Scanning...</span>"
+                 "</td></tr>",
+                 can_connect ? 5 : 4);
+         } else {
+-            snprintf(scan_html, sizeof(scan_html),
++            snprintf(scan_html, scan_html_size,
+                 "<tr><td colspan='%d' style='text-align:center; color:#888;'>No networks found</td></tr>",
+                 can_connect ? 5 : 4);
+         }
+     } else {
+-        for (int i = 0; i < ap_count && html_offset < (int)(sizeof(scan_html) - 512); i++) {
++        for (int i = 0; i < ap_count && html_offset + 768 < scan_html_size; i++) {
+             /* Determine signal strength and build visual bars */
+             const char *signal_class;
+             int rssi = ap_list[i].rssi;
+@@ -3329,7 +3499,7 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
+             snprintf(ch_info, sizeof(ch_info), "%d", ap_list[i].primary);
+ #endif
+ 
+-            html_offset += snprintf(scan_html + html_offset, sizeof(scan_html) - html_offset,
++            html_offset += snprintf(scan_html + html_offset, scan_html_size - html_offset,
+                 "<tr>"
+                 "<td>%s</td>"
+                 "<td style='white-space:nowrap;'>%s<span style='color:#888;font-size:0.8rem;margin-left:0.5em;'>%d dBm</span></td>"
+@@ -3344,6 +3514,13 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
+                 connect_cell
+             );
+ 
++            /* snprintf returns what it *would* have written; without this clamp
++             * a truncated row pushes html_offset past the end and the next
++             * append underflows the remaining-size arithmetic. */
++            if (html_offset >= scan_html_size) {
++                html_offset = scan_html_size - 1;
++            }
++
+             free(safe_ssid);
+         }
+     }
+@@ -3359,6 +3536,7 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
+ 
+     if (scan_page == NULL) {
+         ESP_LOGE(TAG, "Failed to allocate memory for scan page");
++        free(scan_html);
+         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+         return ESP_ERR_NO_MEM;
+     }
+@@ -3367,6 +3545,7 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
+ 
+     httpd_resp_send(req, scan_page, strlen(scan_page));
+     free(scan_page);
++    free(scan_html);
+ 
+     return ESP_OK;
+ }
+@@ -3766,7 +3945,7 @@ httpd_handle_t start_webserver(uint16_t port)
+     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+     config.server_port = port;
+     config.stack_size = 16384;  // Large stack needed for mappings page with 3x 2KB HTML buffers
+-    config.max_uri_handlers = 14;
++    config.max_uri_handlers = 16;
+     config.max_uri_len = 1024;
+     config.open_fn = http_open_fn;
+     /* Fail a stalled send/recv fast (default 5s) so an abandoned connection
+@@ -3807,6 +3986,10 @@ httpd_handle_t start_webserver(uint16_t port)
+         httpd_register_uri_handler(server, &scanp);
+ #endif
+         httpd_register_uri_handler(server, &vpnp);
++#if !CONFIG_ETH_UPLINK
++        httpd_register_uri_handler(server, &portalp);
++        httpd_register_uri_handler(server, &portalp_post);
++#endif
+ #if !CONFIG_ETH_UPLINK
+         httpd_register_uri_handler(server, &setupp);
+ #endif

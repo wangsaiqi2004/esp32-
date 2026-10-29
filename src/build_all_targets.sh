@@ -1,0 +1,364 @@
+#!/bin/bash
+
+# ESP32 NAT Router - Multi-Target Build Script
+# Compiles for all targets defined in BUILD_ORDER sequentially
+
+set -e  # Exit on any error
+
+# Build targets in order
+BUILD_ORDER=("esp32" "wt32_eth01" "esp32_poe_iso" "esp32s3" "esp32c5" "esp32c6" "esp32c3")
+
+# Target descriptions
+declare -A TARGET_DESC=(
+    ["esp32"]="ESP32 (Original)"
+    ["esp32s3"]="ESP32-S3"
+    ["esp32c6"]="ESP32-C6"
+    ["esp32c3"]="ESP32-C3"
+    ["esp32c5"]="ESP32-C5"
+    ["wt32_eth01"]="WT32-ETH01 (Ethernet)"
+    ["esp32_poe_iso"]="Olimex ESP32-POE-ISO (Ethernet)"
+)
+
+# IDF chip target for each build target
+declare -A TARGET_CHIP=(
+    ["esp32"]="esp32"
+    ["esp32s3"]="esp32s3"
+    ["esp32c6"]="esp32c6"
+    ["esp32c3"]="esp32c3"
+    ["esp32c5"]="esp32c5"
+    ["wt32_eth01"]="esp32"
+    ["esp32_poe_iso"]="esp32"
+)
+
+# Extra sdkconfig defaults (semicolon-separated).
+# ESP-IDF automatically applies sdkconfig.defaults.<IDF_TARGET> on top of every
+# file listed here, so the chip targets would work with plain sdkconfig.defaults.
+# The board variants (wt32_eth01, esp32_poe_iso) are not chip names and need
+# their files listed explicitly; the chip entries are spelled out for clarity.
+declare -A TARGET_SDKCONFIG=(
+    ["esp32"]="sdkconfig.defaults"
+    ["esp32s3"]="sdkconfig.defaults;sdkconfig.defaults.esp32s3"
+    ["esp32c6"]="sdkconfig.defaults;sdkconfig.defaults.esp32c6"
+    ["esp32c3"]="sdkconfig.defaults;sdkconfig.defaults.esp32c3"
+    ["esp32c5"]="sdkconfig.defaults;sdkconfig.defaults.esp32c5"
+    ["wt32_eth01"]="sdkconfig.defaults;sdkconfig.defaults.eth_common;sdkconfig.defaults.wt32_eth01"
+    ["esp32_poe_iso"]="sdkconfig.defaults;sdkconfig.defaults.eth_common;sdkconfig.defaults.esp32_poe_iso"
+)
+
+# Per-target build directory and sdkconfig, so a stale config from the previous
+# target can never leak into the next one.
+declare -A TARGET_BUILD_DIR=(
+    ["esp32"]="build_esp32"
+    ["esp32s3"]="build_esp32s3"
+    ["esp32c6"]="build_esp32c6"
+    ["esp32c3"]="build_esp32c3"
+    ["esp32c5"]="build_esp32c5"
+    ["wt32_eth01"]="build_eth"
+    ["esp32_poe_iso"]="build_poe_iso"
+)
+
+declare -A TARGET_SDKCONFIG_FILE=(
+    ["esp32"]="sdkconfig.esp32"
+    ["esp32s3"]="sdkconfig.esp32s3"
+    ["esp32c6"]="sdkconfig.esp32c6"
+    ["esp32c3"]="sdkconfig.esp32c3"
+    ["esp32c5"]="sdkconfig.esp32c5"
+    ["wt32_eth01"]="sdkconfig.eth"
+    ["esp32_poe_iso"]="sdkconfig.poe_iso"
+)
+
+# Warn when the app leaves almost no room in its OTA slot.
+# ota_0 is 1536 KiB (partitions_example.csv). idf.py itself fails the build
+# once the image no longer fits; this only makes the headroom visible.
+OTA_SLOT_BYTES=$((1536 * 1024))
+OTA_MAX_PERCENT=95
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Function to print colored output
+print_status() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Function to build for specific target
+build_target() {
+    local target=$1
+    local description=$2
+    local chip="${TARGET_CHIP[$target]}"
+    local sdkconfig="${TARGET_SDKCONFIG[$target]}"
+    local build_dir="${TARGET_BUILD_DIR[$target]}"
+    local sdkconfig_file="${TARGET_SDKCONFIG_FILE[$target]}"
+    local build_args=()
+
+    print_status "Building for $description ($target)..."
+
+    # Use custom build directory if specified
+    if [ -n "$build_dir" ]; then
+        build_args+=("-B" "$build_dir")
+    fi
+
+    # Use custom sdkconfig file if specified (avoids conflicts with shared sdkconfig)
+    if [ -n "$sdkconfig_file" ]; then
+        build_args+=("-D" "SDKCONFIG=$sdkconfig_file")
+    fi
+
+    # Use custom sdkconfig defaults if specified
+    if [ -n "$sdkconfig" ]; then
+        build_args+=("-D" "SDKCONFIG_DEFAULTS=$sdkconfig")
+    fi
+
+    # Set target using idf.py (use build dir args if custom)
+    idf.py "${build_args[@]}" set-target "$chip"
+
+    # Clean previous build artifacts
+    print_status "Cleaning previous build artifacts..."
+    idf.py "${build_args[@]}" clean
+
+    # Build project
+    print_status "Starting compilation for $target..."
+    if idf.py "${build_args[@]}" build; then
+        if ! check_ota_headroom "$target"; then
+            return 1
+        fi
+        # Save binary artifacts to separate directory
+        save_binary_artifacts "$target" "$description"
+        print_success "Build completed successfully for $target"
+        return 0
+    else
+        print_error "Build failed for $target"
+        return 1
+    fi
+}
+
+# Report how full the OTA slot is and warn when it is nearly exhausted. Without
+# this the C3 and C5 images crept to over 99% of ota_0 unnoticed.
+check_ota_headroom() {
+    local target=$1
+    local build_dir="${TARGET_BUILD_DIR[$target]:-build}"
+    local app="$build_dir/esp32_nat_router.bin"
+
+    [ -f "$app" ] || return 0
+
+    local size
+    size=$(stat -c%s "$app" 2>/dev/null || stat -f%z "$app" 2>/dev/null) || return 0
+    local percent=$((size * 100 / OTA_SLOT_BYTES))
+    local free=$((OTA_SLOT_BYTES - size))
+
+    print_status "  ota_0 usage: $size / $OTA_SLOT_BYTES bytes (${percent}%, ${free} free)"
+
+    if [ "$percent" -ge "$OTA_MAX_PERCENT" ]; then
+        print_warning "$target fills ${percent}% of ota_0 (warning threshold ${OTA_MAX_PERCENT}%)"
+        print_warning "Consider freeing flash before publishing — see 'idf.py size-components'."
+    fi
+    return 0
+}
+
+# Function to save binary artifacts to separate directory
+save_binary_artifacts() {
+    local target=$1
+    local description=$2
+    local artifacts_dir="firmware_$target"
+    
+    print_status "Saving binary artifacts to $artifacts_dir/..."
+
+    # Create artifacts directory if it doesn't exist
+    mkdir -p "$artifacts_dir"
+
+    # Find and copy relevant binary files
+    local build_dir="${TARGET_BUILD_DIR[$target]:-build}"
+    local files_copied=0
+    
+    # Main firmware binary
+    if [ -f "$build_dir/esp32_nat_router.bin" ]; then
+        cp "$build_dir/esp32_nat_router.bin" "$artifacts_dir/"
+        print_status "  ✓ Copied esp32_nat_router.bin"
+        ((files_copied++))
+    fi
+    
+    # Bootloader binary
+    if [ -f "$build_dir/bootloader/bootloader.bin" ]; then
+        cp "$build_dir/bootloader/bootloader.bin" "$artifacts_dir/"
+        print_status "  ✓ Copied bootloader.bin"
+        ((files_copied++))
+    fi
+    
+    # Partition table
+    if [ -f "$build_dir/partition_table/partition-table.bin" ]; then
+        cp "$build_dir/partition_table/partition-table.bin" "$artifacts_dir/"
+        print_status "  ✓ Copied partition-table.bin"
+        ((files_copied++))
+    fi
+
+    # OTA data initial (required for OTA partition layout)
+    if [ -f "$build_dir/ota_data_initial.bin" ]; then
+        cp "$build_dir/ota_data_initial.bin" "$artifacts_dir/"
+        print_status "  ✓ Copied ota_data_initial.bin"
+        ((files_copied++))
+    fi
+
+    # Combined firmware (if available)
+    if [ -f "$build_dir/esp32_nat_router-merged.bin" ]; then
+        cp "$build_dir/esp32_nat_router-merged.bin" "$artifacts_dir/"
+        print_status "  ✓ Copied esp32_nat_router-merged.bin"
+        ((files_copied++))
+    fi
+    
+    # Copy any other .bin files
+    for bin_file in "$build_dir"/*.bin; do
+        if [ -f "$bin_file" ]; then
+            local filename=$(basename "$bin_file")
+            if [ ! -f "$artifacts_dir/$filename" ]; then
+                cp "$bin_file" "$artifacts_dir/"
+                print_status "  ✓ Copied $filename"
+                ((files_copied++))
+            fi
+        fi
+    done
+    
+    # Create a version info file
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local git_hash=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    cat > "$artifacts_dir/build_info.txt" << EOF
+ESP32 NAT Router Build Information
+=================================
+Target: $description ($target)
+Build Time: $timestamp
+Git Hash: $git_hash
+Binary Files: $files_copied
+Build Directory: $build_dir
+EOF
+    
+    print_status "  ✓ Created build_info.txt"
+    print_success "Saved $files_copied binary files to $artifacts_dir/"
+}
+
+# Function to check if idf.py is available
+check_idf_env() {
+    if ! command -v idf.py &> /dev/null; then
+        print_error "idf.py not found. ESP-IDF environment not set up properly."
+        print_error "Please source ESP-IDF export script first:"
+        print_error "  source /path/to/esp-idf/export.sh"
+        exit 1
+    fi
+}
+
+# Main script execution
+main() {
+    print_status "ESP32 NAT Router Multi-Target Build Script"
+    print_status "=========================================="
+    
+    # Check if ESP-IDF environment is set up
+    check_idf_env
+    
+    # Store current directory
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    cd "$SCRIPT_DIR"
+    
+    print_status "Working directory: $(pwd)"
+    
+    # Array to store failed targets
+    FAILED_TARGETS=()
+
+    # Build for each target
+    for target in "${BUILD_ORDER[@]}"; do
+        description="${TARGET_DESC[$target]}"
+        echo ""
+        print_status "=========================================="
+        
+        if ! build_target "$target" "$description"; then
+            FAILED_TARGETS+=("$target")
+        fi
+        
+        echo ""
+    done
+    
+    # Final summary
+    print_status "=========================================="
+    print_status "Build Summary"
+    print_status "=========================================="
+    
+    if [ ${#FAILED_TARGETS[@]} -eq 0 ]; then
+        print_success "All targets built successfully!"
+        print_status "Binary artifacts are preserved in firmware directories:"
+        for target in "${BUILD_ORDER[@]}"; do
+            artifacts_dir="firmware_$target"
+            if [ -d "$artifacts_dir" ]; then
+                print_status "  - $artifacts_dir/ (preserved)"
+            fi
+        done
+        print_status "Build directories (will be cleaned on next build):"
+        for target in "${BUILD_ORDER[@]}"; do
+            if [ -d "build/$target" ]; then
+                print_status "  - build/$target/"
+            fi
+        done
+    else
+        print_error "Build failed for ${#FAILED_TARGETS[@]} target(s):"
+        for failed_target in "${FAILED_TARGETS[@]}"; do
+            print_error "  - $failed_target (${TARGET_DESC[$failed_target]})"
+        done
+        exit 1
+    fi
+    
+    # Show preserved binary sizes
+    echo ""
+    print_status "Preserved Binary Sizes:"
+    print_status "======================="
+    for target in "${BUILD_ORDER[@]}"; do
+        artifacts_dir="firmware_$target"
+        if [ -f "$artifacts_dir/esp32_nat_router.bin" ]; then
+            size=$(stat -f%z "$artifacts_dir/esp32_nat_router.bin" 2>/dev/null || stat -c%s "$artifacts_dir/esp32_nat_router.bin" 2>/dev/null || echo "unknown")
+            print_status "  $target: $size bytes ($artifacts_dir/esp32_nat_router.bin)"
+        fi
+    done
+    
+    # Show total size of all preserved artifacts
+    echo ""
+    total_size=0
+    for target in "${BUILD_ORDER[@]}"; do
+        artifacts_dir="firmware_$target"
+        if [ -d "$artifacts_dir" ]; then
+            for bin_file in "$artifacts_dir"/*.bin; do
+                if [ -f "$bin_file" ]; then
+                    size=$(stat -f%z "$bin_file" 2>/dev/null || stat -c%s "$bin_file" 2>/dev/null || echo "0")
+                    total_size=$((total_size + size))
+                fi
+            done
+        fi
+    done
+    
+    if [ $total_size -gt 0 ]; then
+        if command -v numfmt &> /dev/null; then
+            human_size=$(numfmt --to=iec $total_size)
+        else
+            human_size="${total_size} bytes"
+        fi
+        print_status "Total preserved artifacts: $human_size"
+    fi
+    
+    print_success "Multi-target build script completed!"
+    print_status "Binary artifacts are preserved in firmware_* directories and will not be cleaned."
+}
+
+# Handle script interruption
+trap 'print_warning "Script interrupted by user"; exit 1' INT
+
+# Run main function
+main "$@"

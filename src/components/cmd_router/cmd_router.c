@@ -1,0 +1,4007 @@
+/* The CLI commands of the router
+
+   Unless required by applicable law or agreed to in writing, this
+   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+   CONDITIONS OF ANY KIND, either express or implied.
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <time.h>
+#include <inttypes.h>
+#include <stdint.h>
+#include "esp_log.h"
+#include "esp_console.h"
+#include "esp_system.h"
+#include "esp_sleep.h"
+#include "spi_flash_mmap.h"
+#include "driver/rtc_io.h"
+#include "driver/uart.h"
+#include "argtable3/argtable3.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "sdkconfig.h"
+#include "nvs.h"
+#include "esp_wifi.h"
+
+#include "lwip/ip4_addr.h"
+#include "lwip/netif.h"
+#include "esp_netif.h"
+#if !IP_NAPT
+#error "IP_NAPT must be defined"
+#endif
+#include "lwip/lwip_napt.h"
+
+#include "mbedtls/sha256.h"
+#include "esp_random.h"
+
+#include "driver/gpio.h"
+#include "soc/soc_caps.h"
+#if SOC_TEMP_SENSOR_SUPPORTED
+#include "driver/temperature_sensor.h"
+#endif
+#include "router_globals.h"
+#include "cmd_router.h"
+#include "pcap_capture.h"
+#include "acl.h"
+#include "remote_console.h"
+/* web UI bind API */
+extern uint8_t web_ui_get_bind(void);
+extern void    web_ui_set_bind(uint8_t bind);
+#include "syslog_client.h"
+#include "oled_display.h"
+#include "esp_ota_ops.h"
+#include "esp_app_desc.h"
+
+#ifdef CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS
+#define WITH_TASKS_INFO 1
+#endif
+
+static const char *TAG = "cmd_router";
+
+static void register_set_hostname(void);
+#if !CONFIG_ETH_UPLINK
+static void register_set_sta(void);
+static void register_set_mac(void);
+#else
+static void register_set_ap_mac_only(void);
+#endif
+static void register_set_sta_static(void);
+static void register_set_ap(void);
+static void register_set_ap_ip(void);
+static void register_set_ap_hidden(void);
+static void register_set_ap_known_only(void);
+static void register_set_ap_auth(void);
+static void register_ap(void);
+#if CONFIG_ETH_UPLINK
+static void register_set_ap_channel(void);
+#endif
+static void register_set_ap_dns(void);
+static void register_show(void);
+static void register_portmap(void);
+static void register_dhcp_reserve(void);
+static void register_set_router_password(void);
+static void register_web_ui(void);
+static void register_bytes(void);
+static void register_pcap(void);
+static void register_set_led_gpio(void);
+static void register_set_led_lowactive(void);
+static void register_set_led_strip(void);
+static void register_set_ttl(void);
+static void register_set_watchdog(void);
+static void register_client_stats_cmd(void);
+static void register_set_ap_nat(void);
+static void register_set_tx_power(void);
+static void register_set_wifi_country(void);
+static void register_set_antenna(void);
+#if defined(CONFIG_IDF_TARGET_ESP32C6)
+static void register_set_rf_switch(void);
+#endif
+static void register_acl(void);
+static void register_remote_console_cmd(void);
+static void register_syslog_cmd(void);
+#if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S3)
+static void register_set_oled(void);
+static void register_set_oled_gpio(void);
+#endif
+#if !CONFIG_ETH_UPLINK
+static void register_scan(void);
+#endif
+#if WIFI_HAS_5GHZ
+static void register_set_sta_band(void);
+#endif
+static void register_set_vpn(void);
+static void register_set_tz(void);
+
+/* ACL helper functions (forward declarations) */
+static char* acl_format_ip_with_name(uint32_t ip, uint32_t mask, char* buf, size_t buf_len);
+static bool acl_parse_ip_or_name(const char* str, uint32_t* ip, uint32_t* mask);
+static void acl_print_with_names(uint8_t acl_no);
+
+/* Check if character is a valid hex digit */
+static inline int is_hex_digit(char c)
+{
+    return (c >= '0' && c <= '9') ||
+           (c >= 'A' && c <= 'F') ||
+           (c >= 'a' && c <= 'f');
+}
+
+/* Convert hex digit to value (assumes valid hex digit) */
+static inline uint8_t hex_digit_value(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    else
+        return toupper((unsigned char)c) - 'A' + 10;
+}
+
+/* Check if string represents a boolean true value */
+static inline bool parse_bool_true(const char *str)
+{
+    return (strcasecmp(str, "true") == 0 ||
+            strcasecmp(str, "yes") == 0 ||
+            strcasecmp(str, "on") == 0 ||
+            strcmp(str, "1") == 0);
+}
+
+/* Check if string represents a boolean false value */
+static inline bool parse_bool_false(const char *str)
+{
+    return (strcasecmp(str, "false") == 0 ||
+            strcasecmp(str, "no") == 0 ||
+            strcasecmp(str, "off") == 0 ||
+            strcmp(str, "0") == 0);
+}
+
+void preprocess_string(char* str)
+{
+    char *p, *q;
+
+    for (p = q = str; *p != 0; p++)
+    {
+        if (*(p) == '%' && *(p + 1) != 0 && *(p + 2) != 0 &&
+            is_hex_digit(*(p + 1)) && is_hex_digit(*(p + 2)))
+        {
+            // Valid percent-encoded hex sequence
+            p++;
+            uint8_t a = hex_digit_value(*p) << 4;
+            p++;
+            a += hex_digit_value(*p);
+            *q++ = a;
+        }
+        else if (*(p) == '+') {
+            *q++ = ' ';
+        } else {
+            *q++ = *p;
+        }
+    }
+    *q = '\0';
+}
+
+/* Keys whose value must never reach the console, the log, or syslog. */
+static bool is_secret_param(const char *name)
+{
+    static const char *const secrets[] = {
+        "passwd", "ap_passwd", "vpn_privkey", "vpn_psk", "web_password", "mqtt_pass"
+    };
+    for (size_t i = 0; i < sizeof(secrets) / sizeof(secrets[0]); i++) {
+        if (strcmp(name, secrets[i]) == 0) return true;
+    }
+    return false;
+}
+
+esp_err_t get_config_param_str(char* name, char** param)
+{
+    nvs_handle_t nvs;
+
+    esp_err_t err = nvs_open(PARAM_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_OK) {
+        size_t len;
+        if ( (err = nvs_get_str(nvs, name, NULL, &len)) == ESP_OK) {
+            *param = (char *)malloc(len);
+            if (*param == NULL) {
+                nvs_close(nvs);
+                return ESP_ERR_NO_MEM;
+            }
+            err = nvs_get_str(nvs, name, *param, &len);
+            ESP_LOGI(TAG, "%s %s", name, is_secret_param(name) ? "<hidden>" : *param);
+        } else {
+            /* Key missing (NVS_NOT_FOUND) is the common case for optional keys;
+             * must still close the handle here or it leaks on every lookup —
+             * e.g. http_open_fn reads optional keys on every connection. */
+            nvs_close(nvs);
+            return err;
+        }
+        nvs_close(nvs);
+    } else {
+        return err;
+    }
+    return ESP_OK;
+}
+
+esp_err_t get_config_param_int(char* name, int* param)
+{
+    nvs_handle_t nvs;
+
+    esp_err_t err = nvs_open(PARAM_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_OK) {
+        if ( (err = nvs_get_i32(nvs, name, (int32_t*)(param))) == ESP_OK) {
+            ESP_LOGI(TAG, "%s %d", name, *param);
+        } else {
+            /* Key missing (NVS_NOT_FOUND) is the common case for optional keys;
+             * must still close the handle here or it leaks on every lookup —
+             * e.g. http_open_fn reads optional keys on every connection. */
+            nvs_close(nvs);
+            return err;
+        }
+        nvs_close(nvs);
+    } else {
+        return err;
+    }
+    return ESP_OK;
+}
+
+esp_err_t get_config_param_blob(char* name, uint8_t** blob, size_t blob_len)
+{
+    nvs_handle_t nvs;
+
+    esp_err_t err = nvs_open(PARAM_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_OK) {
+        size_t len;
+        if ( (err = nvs_get_blob(nvs, name, NULL, &len)) == ESP_OK) {
+            if (len != blob_len) {
+                nvs_close(nvs);
+                return ESP_ERR_NVS_INVALID_LENGTH;
+            }
+            *blob = (uint8_t *)malloc(len);
+            if (*blob == NULL) {
+                nvs_close(nvs);
+                return ESP_ERR_NO_MEM;
+            }
+            err = nvs_get_blob(nvs, name, *blob, &len);
+            ESP_LOGI(TAG, "%s: %d", name, len);
+        } else {
+            /* Key missing (NVS_NOT_FOUND) is the common case for optional keys;
+             * must still close the handle here or it leaks on every lookup —
+             * e.g. http_open_fn reads optional keys on every connection. */
+            nvs_close(nvs);
+            return err;
+        }
+        nvs_close(nvs);
+    } else {
+        return err;
+    }
+    return ESP_OK;
+}
+
+esp_err_t set_config_param_str(const char* name, const char* value)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PARAM_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(nvs, name, value);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
+}
+
+esp_err_t set_config_param_int(const char* name, int32_t value)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PARAM_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    err = nvs_set_i32(nvs, name, value);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
+}
+
+esp_err_t set_config_param_blob(const char* name, const void* data, size_t len)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PARAM_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(nvs, name, data, len);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
+}
+
+/* Convert a CIDR prefix length (0-32) into a dotted-decimal netmask string. */
+static void prefix_to_netmask(int prefix, char *out, size_t out_len)
+{
+    if (prefix < 0) prefix = 0;
+    if (prefix > 32) prefix = 32;
+    uint32_t mask = prefix ? (0xFFFFFFFFu << (32 - prefix)) : 0;
+    snprintf(out, out_len, "%u.%u.%u.%u",
+             (unsigned)((mask >> 24) & 0xFF), (unsigned)((mask >> 16) & 0xFF),
+             (unsigned)((mask >> 8) & 0xFF),  (unsigned)(mask & 0xFF));
+}
+
+/* Trim leading/trailing ASCII whitespace in place; returns a pointer into s. */
+static char *trim_ws(char *s)
+{
+    while (*s && isspace((unsigned char)*s)) s++;
+    if (*s == '\0') return s;
+    char *end = s + strlen(s) - 1;
+    while (end > s && isspace((unsigned char)*end)) *end-- = '\0';
+    return s;
+}
+
+/* Parse a standard WireGuard .conf file and persist the mapped vpn_* settings.
+ * Maps [Interface]/[Peer] keys onto this router's existing NVS parameters; see
+ * vpn_config.h. Sets vpn_enabled=1 on success. IPv6 addresses are skipped. */
+esp_err_t vpn_import_conf(const char *text)
+{
+    if (text == NULL) return ESP_ERR_INVALID_ARG;
+
+    char *buf = strdup(text);
+    if (!buf) return ESP_ERR_NO_MEM;
+
+    char privkey[128] = "", pubkey[128] = "", psk[128] = "";
+    char endpoint_host[128] = "", address_ip[48] = "", netmask[16] = "", dns[128] = "";
+    int port = 51820, keepalive = 0, route_all = -1, mtu = 0;
+    bool have_port = false;
+
+    char *save = NULL;
+    for (char *line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        char *p = trim_ws(line);
+        if (*p == '\0' || *p == '#' || *p == ';' || *p == '[') continue;  /* blank/comment/section */
+
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = trim_ws(p);
+        char *val = trim_ws(eq + 1);
+        if (*val == '\0') continue;
+
+        if (strcasecmp(key, "PrivateKey") == 0) {
+            strlcpy(privkey, val, sizeof(privkey));
+        } else if (strcasecmp(key, "PublicKey") == 0) {
+            strlcpy(pubkey, val, sizeof(pubkey));
+        } else if (strcasecmp(key, "PresharedKey") == 0) {
+            strlcpy(psk, val, sizeof(psk));
+        } else if (strcasecmp(key, "Address") == 0) {
+            char *comma = strchr(val, ',');           /* first entry only (IPv4) */
+            if (comma) *comma = '\0';
+            char *first = trim_ws(val);
+            char *slash = strchr(first, '/');
+            int prefix = 32;
+            if (slash) { *slash = '\0'; prefix = atoi(slash + 1); }
+            strlcpy(address_ip, trim_ws(first), sizeof(address_ip));
+            prefix_to_netmask(prefix, netmask, sizeof(netmask));
+        } else if (strcasecmp(key, "DNS") == 0) {
+            char *comma = strchr(val, ',');           /* first DNS only */
+            if (comma) *comma = '\0';
+            strlcpy(dns, trim_ws(val), sizeof(dns));
+        } else if (strcasecmp(key, "Endpoint") == 0) {
+            char *colon = strrchr(val, ':');          /* host:port */
+            if (colon) { *colon = '\0'; port = atoi(colon + 1); have_port = true; }
+            strlcpy(endpoint_host, trim_ws(val), sizeof(endpoint_host));
+        } else if (strcasecmp(key, "PersistentKeepalive") == 0) {
+            keepalive = atoi(val);
+        } else if (strcasecmp(key, "MTU") == 0) {
+            mtu = atoi(val);
+        } else if (strcasecmp(key, "AllowedIPs") == 0) {
+            route_all = (strstr(val, "0.0.0.0/0") != NULL) ? 1 : 0;
+        }
+    }
+
+    free(buf);
+
+    if (privkey[0] == '\0' || pubkey[0] == '\0' ||
+        endpoint_host[0] == '\0' || address_ip[0] == '\0') {
+        ESP_LOGE(TAG, "WireGuard import: missing required field (need PrivateKey, PublicKey, Endpoint, Address)");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    set_config_param_str("vpn_privkey", privkey);
+    set_config_param_str("vpn_pubkey", pubkey);
+    set_config_param_str("vpn_psk", psk);              /* may be empty */
+    set_config_param_str("vpn_endpoint", endpoint_host);
+    set_config_param_str("vpn_ip", address_ip);
+    set_config_param_str("vpn_mask", netmask[0] ? netmask : "255.255.255.255");
+    if (dns[0]) set_config_param_str("vpn_dns", dns);
+    if (have_port) set_config_param_int("vpn_port", port);
+    set_config_param_int("vpn_ka", keepalive);
+    if (mtu > 0) set_config_param_int("vpn_mtu", mtu);
+    if (route_all >= 0) set_config_param_int("vpn_rall", route_all);
+    set_config_param_int("vpn_enabled", 1);
+
+    ESP_LOGI(TAG, "WireGuard config imported (endpoint=%s:%d ip=%s dns=%s route_all=%d)",
+             endpoint_host, port, address_ip, dns[0] ? dns : "(none)", route_all);
+    return ESP_OK;
+}
+
+void register_router(void)
+{
+    register_show();
+#if !CONFIG_ETH_UPLINK
+    register_set_sta();
+    register_set_mac();
+#else
+    register_set_ap_mac_only();
+#endif
+#if !CONFIG_ETH_UPLINK
+    register_scan();
+#endif
+    register_set_sta_static();
+    register_set_ap();
+    register_set_ap_ip();
+    register_set_ap_dns();
+    register_dhcp_reserve();
+    register_portmap();
+    register_acl();
+    register_bytes();
+    register_pcap();
+    register_web_ui();
+    register_set_router_password();
+    register_set_led_gpio();
+    register_set_led_lowactive();
+    register_set_led_strip();
+    register_set_ttl();
+    register_set_watchdog();
+    register_client_stats_cmd();
+    register_set_ap_nat();
+    register_set_tx_power();
+    register_set_wifi_country();
+    register_set_ap_hidden();
+    register_set_ap_known_only();
+    register_set_ap_auth();
+    register_ap();
+#if CONFIG_ETH_UPLINK
+    register_set_ap_channel();
+#endif
+    register_set_hostname();
+#if WIFI_HAS_5GHZ
+    register_set_sta_band();
+#endif
+    register_set_antenna();
+#if defined(CONFIG_IDF_TARGET_ESP32C6)
+    register_set_rf_switch();
+#endif
+    register_remote_console_cmd();
+    register_syslog_cmd();
+    register_set_tz();
+    register_set_vpn();
+#if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S3)
+    register_set_oled();
+    register_set_oled_gpio();
+#endif
+}
+
+#if !CONFIG_ETH_UPLINK
+/** Arguments used by 'set_sta' function */
+static struct {
+    struct arg_str* ssid;
+    struct arg_str* password;
+    struct arg_str* ent_username;
+    struct arg_str* ent_identity;
+    struct arg_int* eap_method;
+    struct arg_int* ttls_phase2;
+    struct arg_int* cert_bundle;
+    struct arg_int* no_time_check;
+    struct arg_end* end;
+} set_sta_arg;
+
+/* 'set_sta' command */
+int set_sta(int argc, char **argv)
+{
+    esp_err_t err;
+    nvs_handle_t nvs;
+
+    int nerrors = arg_parse(argc, argv, (void **) &set_sta_arg);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, set_sta_arg.end, argv[0]);
+        return 1;
+    }
+
+    preprocess_string((char*)set_sta_arg.ssid->sval[0]);
+    preprocess_string((char*)set_sta_arg.password->sval[0]);
+
+    err = nvs_open(PARAM_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_str(nvs, "ssid", set_sta_arg.ssid->sval[0]);
+    if (err == ESP_OK) {
+        err = nvs_set_str(nvs, "passwd", set_sta_arg.password->sval[0]);
+        if (err == ESP_OK) {
+            if (set_sta_arg.ent_username->count > 0) {
+                err = nvs_set_str(nvs, "ent_username", set_sta_arg.ent_username->sval[0]);
+            }
+            else {
+                err = nvs_set_str(nvs, "ent_username", "");
+            }
+
+            if (err == ESP_OK) {
+                if (set_sta_arg.ent_identity->count > 0) {
+                    err = nvs_set_str(nvs, "ent_identity", set_sta_arg.ent_identity->sval[0]);
+                }
+                else {
+                    err = nvs_set_str(nvs, "ent_identity", "");
+                }
+
+                if (err == ESP_OK) {
+                    // Save WPA2-Enterprise settings
+                    if (set_sta_arg.eap_method->count > 0) {
+                        nvs_set_i32(nvs, "eap_method", set_sta_arg.eap_method->ival[0]);
+                        eap_method = set_sta_arg.eap_method->ival[0];
+                    }
+                    if (set_sta_arg.ttls_phase2->count > 0) {
+                        nvs_set_i32(nvs, "ttls_phase2", set_sta_arg.ttls_phase2->ival[0]);
+                        ttls_phase2 = set_sta_arg.ttls_phase2->ival[0];
+                    }
+                    if (set_sta_arg.cert_bundle->count > 0) {
+                        nvs_set_i32(nvs, "cert_bundle", set_sta_arg.cert_bundle->ival[0]);
+                        use_cert_bundle = set_sta_arg.cert_bundle->ival[0];
+                    }
+                    if (set_sta_arg.no_time_check->count > 0) {
+                        nvs_set_i32(nvs, "no_time_chk", set_sta_arg.no_time_check->ival[0]);
+                        disable_time_check = set_sta_arg.no_time_check->ival[0];
+                    }
+
+                    err = nvs_commit(nvs);
+                    if (err == ESP_OK) {
+                        ESP_LOGI(TAG, "STA settings stored (ssid=%s).", set_sta_arg.ssid->sval[0]);
+                    }
+                }
+            }
+        }
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+static void register_set_sta(void)
+{
+    set_sta_arg.ssid = arg_str1(NULL, NULL, "<ssid>", "SSID");
+    set_sta_arg.password = arg_str1(NULL, NULL, "<passwd>", "Password");
+    set_sta_arg.ent_username = arg_str0("-u", "--username", "<ent_username>", "Enterprise username");
+    set_sta_arg.ent_identity = arg_str0("-a", "--identity", "<ent_identity>", "Enterprise identity");
+    set_sta_arg.eap_method = arg_int0("-e", "--eap", "<0-3>", "EAP method (0=Auto,1=PEAP,2=TTLS,3=TLS)");
+    set_sta_arg.ttls_phase2 = arg_int0("-p", "--phase2", "<0-3>", "TTLS phase2 (0=MSCHAPv2,1=MSCHAP,2=PAP,3=CHAP)");
+    set_sta_arg.cert_bundle = arg_int0("-c", "--cert-bundle", "<0|1>", "Use CA cert bundle");
+    set_sta_arg.no_time_check = arg_int0("-t", "--no-time-check", "<0|1>", "Skip cert time check");
+    set_sta_arg.end = arg_end(6);
+
+    const esp_console_cmd_t cmd = {
+        .command = "set_sta",
+        .help = "Set SSID and password of the STA interface",
+        .hint = NULL,
+        .func = &set_sta,
+        .argtable = &set_sta_arg
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+#endif
+
+
+/** Arguments used by 'set_sta_static' function */
+static struct {
+    struct arg_str *static_ip;
+    struct arg_str *subnet_mask;
+    struct arg_str *gateway_addr;
+    struct arg_end *end;
+} set_sta_static_arg;
+
+/* 'set_sta_static' command */
+int set_sta_static(int argc, char **argv)
+{
+    esp_err_t err;
+    nvs_handle_t nvs;
+
+    /* "set_sta_static dhcp" clears static IP and reverts to DHCP */
+    if (argc == 2 && strcmp(argv[1], "dhcp") == 0) {
+        err = nvs_open(PARAM_NAMESPACE, NVS_READWRITE, &nvs);
+        if (err != ESP_OK) {
+            return err;
+        }
+        nvs_erase_key(nvs, "static_ip");
+        nvs_erase_key(nvs, "subnet_mask");
+        nvs_erase_key(nvs, "gateway_addr");
+        err = nvs_commit(nvs);
+        nvs_close(nvs);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Static IP cleared. Will use DHCP after reboot.");
+        }
+        return err;
+    }
+
+    int nerrors = arg_parse(argc, argv, (void **) &set_sta_static_arg);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, set_sta_static_arg.end, argv[0]);
+        return 1;
+    }
+
+    preprocess_string((char*)set_sta_static_arg.static_ip->sval[0]);
+    preprocess_string((char*)set_sta_static_arg.subnet_mask->sval[0]);
+    preprocess_string((char*)set_sta_static_arg.gateway_addr->sval[0]);
+
+    err = nvs_open(PARAM_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_str(nvs, "static_ip", set_sta_static_arg.static_ip->sval[0]);
+    if (err == ESP_OK) {
+        err = nvs_set_str(nvs, "subnet_mask", set_sta_static_arg.subnet_mask->sval[0]);
+        if (err == ESP_OK) {
+            err = nvs_set_str(nvs, "gateway_addr", set_sta_static_arg.gateway_addr->sval[0]);
+            if (err == ESP_OK) {
+              err = nvs_commit(nvs);
+                if (err == ESP_OK) {
+                    ESP_LOGI(TAG, "STA Static IP settings %s/%s/%s stored.", set_sta_static_arg.static_ip->sval[0], set_sta_static_arg.subnet_mask->sval[0], set_sta_static_arg.gateway_addr->sval[0]);
+                }
+            }
+        }
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+static void register_set_sta_static(void)
+{
+    set_sta_static_arg.static_ip = arg_str1(NULL, NULL, "<ip>", "IP");
+    set_sta_static_arg.subnet_mask = arg_str1(NULL, NULL, "<subnet>", "Subnet Mask");
+    set_sta_static_arg.gateway_addr = arg_str1(NULL, NULL, "<gw>", "Gateway Address");
+    set_sta_static_arg.end = arg_end(3);
+
+    const esp_console_cmd_t cmd = {
+        .command = "set_sta_static",
+        .help = "Set Static IP for the STA interface, or 'set_sta_static dhcp' to use DHCP",
+        .hint = NULL,
+        .func = &set_sta_static,
+        .argtable = &set_sta_static_arg
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/** Arguments used by 'set_mac' function */
+static struct {
+    struct arg_int *mac0;
+    struct arg_int *mac1;
+    struct arg_int *mac2;
+    struct arg_int *mac3;
+    struct arg_int *mac4;
+    struct arg_int *mac5;
+    struct arg_end *end;
+} set_mac_arg;
+
+esp_err_t set_mac(const char *key, const char *interface, int argc, char **argv) {
+    esp_err_t err;
+    nvs_handle_t nvs;
+
+    int nerrors = arg_parse(argc, argv, (void **) &set_mac_arg);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, set_mac_arg.end, argv[0]);
+        return 1;
+    }
+
+    err = nvs_open(PARAM_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uint8_t mac[] = {set_mac_arg.mac0->ival[0], set_mac_arg.mac1->ival[0], set_mac_arg.mac2->ival[0], set_mac_arg.mac3->ival[0], set_mac_arg.mac4->ival[0], set_mac_arg.mac5->ival[0]};
+    err = nvs_set_blob(nvs, key, mac, sizeof(mac));
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "%s mac address %02X:%02X:%02X:%02X:%02X:%02X stored.", interface, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        }
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+#if !CONFIG_ETH_UPLINK
+int set_sta_mac(int argc, char **argv) {
+    return set_mac("mac", "STA", argc, argv);
+}
+#endif
+
+int set_ap_mac(int argc, char **argv) {
+    return set_mac("ap_mac", "AP", argc, argv);
+}
+
+#if !CONFIG_ETH_UPLINK
+static void register_set_mac(void)
+{
+    set_mac_arg.mac0 = arg_int1(NULL, NULL, "<octet>", "First octet");
+    set_mac_arg.mac1 = arg_int1(NULL, NULL, "<octet>", "Second octet");
+    set_mac_arg.mac2 = arg_int1(NULL, NULL, "<octet>", "Third octet");
+    set_mac_arg.mac3 = arg_int1(NULL, NULL, "<octet>", "Fourth octet");
+    set_mac_arg.mac4 = arg_int1(NULL, NULL, "<octet>", "Fifth octet");
+    set_mac_arg.mac5 = arg_int1(NULL, NULL, "<octet>", "Sixth octet");
+    set_mac_arg.end = arg_end(6);
+
+    const esp_console_cmd_t cmd_sta = {
+        .command = "set_sta_mac",
+        .help = "Set MAC address of the STA interface",
+        .hint = NULL,
+        .func = &set_sta_mac,
+        .argtable = &set_mac_arg
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd_sta) );
+
+    const esp_console_cmd_t cmd_ap = {
+        .command = "set_ap_mac",
+        .help = "Set MAC address of the AP interface",
+        .hint = NULL,
+        .func = &set_ap_mac,
+        .argtable = &set_mac_arg
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd_ap) );
+}
+#else
+static void register_set_ap_mac_only(void)
+{
+    set_mac_arg.mac0 = arg_int1(NULL, NULL, "<octet>", "First octet");
+    set_mac_arg.mac1 = arg_int1(NULL, NULL, "<octet>", "Second octet");
+    set_mac_arg.mac2 = arg_int1(NULL, NULL, "<octet>", "Third octet");
+    set_mac_arg.mac3 = arg_int1(NULL, NULL, "<octet>", "Fourth octet");
+    set_mac_arg.mac4 = arg_int1(NULL, NULL, "<octet>", "Fifth octet");
+    set_mac_arg.mac5 = arg_int1(NULL, NULL, "<octet>", "Sixth octet");
+    set_mac_arg.end = arg_end(6);
+
+    const esp_console_cmd_t cmd_ap = {
+        .command = "set_ap_mac",
+        .help = "Set MAC address of the AP interface",
+        .hint = NULL,
+        .func = &set_ap_mac,
+        .argtable = &set_mac_arg
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd_ap) );
+}
+#endif
+
+/** Arguments used by 'set_ap' function */
+static struct {
+    struct arg_str *ssid;
+    struct arg_str *password;
+    struct arg_end *end;
+} set_ap_args;
+
+/* 'set_ap' command */
+int set_ap(int argc, char **argv)
+{
+    esp_err_t err;
+    nvs_handle_t nvs;
+
+    int nerrors = arg_parse(argc, argv, (void **) &set_ap_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, set_ap_args.end, argv[0]);
+        return 1;
+    }
+
+    preprocess_string((char*)set_ap_args.ssid->sval[0]);
+    preprocess_string((char*)set_ap_args.password->sval[0]);
+
+    if (strlen(set_ap_args.password->sval[0]) < 8) {
+        printf("AP will be open (no passwd needed).\n");
+    }
+
+    err = nvs_open(PARAM_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_str(nvs, "ap_ssid", set_ap_args.ssid->sval[0]);
+    if (err == ESP_OK) {
+        err = nvs_set_str(nvs, "ap_passwd", set_ap_args.password->sval[0]);
+        if (err == ESP_OK) {
+            err = nvs_commit(nvs);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "AP settings stored (ssid=%s).", set_ap_args.ssid->sval[0]);
+            }
+        }
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+static void register_set_ap(void)
+{
+    set_ap_args.ssid = arg_str1(NULL, NULL, "<ssid>", "SSID of AP");
+    set_ap_args.password = arg_str1(NULL, NULL, "<passwd>", "Password of AP");
+    set_ap_args.end = arg_end(2);
+
+    const esp_console_cmd_t cmd = {
+        .command = "set_ap",
+        .help = "Set SSID and password of the SoftAP",
+        .hint = NULL,
+        .func = &set_ap,
+        .argtable = &set_ap_args
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/** Arguments used by 'set_ap_ip' function */
+static struct {
+    struct arg_str *ap_ip_str;
+    struct arg_end *end;
+} set_ap_ip_arg;
+
+
+/* 'set_ap_ip' command */
+int set_ap_ip(int argc, char **argv)
+{
+    esp_err_t err;
+
+    int nerrors = arg_parse(argc, argv, (void **) &set_ap_ip_arg);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, set_ap_ip_arg.end, argv[0]);
+        return 1;
+    }
+
+    preprocess_string((char*)set_ap_ip_arg.ap_ip_str->sval[0]);
+
+    // Get current AP IP to check if network is changing
+    char* old_ap_ip = NULL;
+    get_config_param_str("ap_ip", &old_ap_ip);
+
+    // Parse new IP
+    uint32_t new_ip = esp_ip4addr_aton((char*)set_ap_ip_arg.ap_ip_str->sval[0]);
+
+    // Check if we're changing to a different Class C network
+    bool clear_config = false;
+    if (old_ap_ip != NULL) {
+        uint32_t old_ip = esp_ip4addr_aton(old_ap_ip);
+
+        // Compare first 3 octets (Class C network: /24)
+        if ((old_ip & 0xFFFFFF00) != (new_ip & 0xFFFFFF00)) {
+            clear_config = true;
+            ESP_LOGI(TAG, "AP IP network changed from %s to %s - clearing reservations and port mappings",
+                     old_ap_ip, set_ap_ip_arg.ap_ip_str->sval[0]);
+        }
+        free(old_ap_ip);
+    }
+
+    err = set_config_param_str("ap_ip", set_ap_ip_arg.ap_ip_str->sval[0]);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "AP IP address %s stored.", set_ap_ip_arg.ap_ip_str->sval[0]);
+    }
+
+    // Clear DHCP reservations and port mappings if network changed
+    if (clear_config && err == ESP_OK) {
+        clear_all_dhcp_reservations();
+        clear_all_portmaps();
+    }
+
+    return err;
+}
+
+static void register_set_ap_ip(void)
+{
+    set_ap_ip_arg.ap_ip_str = arg_str1(NULL, NULL, "<ip>", "IP");
+    set_ap_ip_arg.end = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command = "set_ap_ip",
+        .help = "Set IP for the AP interface",
+        .hint = NULL,
+        .func = &set_ap_ip,
+        .argtable = &set_ap_ip_arg
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/** Arguments used by 'set_ap_dns' function */
+static struct {
+    struct arg_str *dns_str;
+    struct arg_end *end;
+} set_ap_dns_arg;
+
+/* 'set_ap_dns' command */
+static int set_ap_dns(int argc, char **argv)
+{
+    esp_err_t err;
+
+    int nerrors = arg_parse(argc, argv, (void **) &set_ap_dns_arg);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, set_ap_dns_arg.end, argv[0]);
+        return 1;
+    }
+
+    preprocess_string((char*)set_ap_dns_arg.dns_str->sval[0]);
+
+    err = set_config_param_str("ap_dns", set_ap_dns_arg.dns_str->sval[0]);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "AP DNS server '%s' stored.", set_ap_dns_arg.dns_str->sval[0]);
+        printf("AP DNS set to: %s\n", set_ap_dns_arg.dns_str->sval[0]);
+        if (strlen(set_ap_dns_arg.dns_str->sval[0]) == 0) {
+            printf("DNS will be learned from upstream (default behavior).\n");
+        }
+        printf("Restart to apply.\n");
+    }
+
+    // Update global
+    free(ap_dns);
+    ap_dns = strdup(set_ap_dns_arg.dns_str->sval[0]);
+
+    return err;
+}
+
+static void register_set_ap_dns(void)
+{
+    set_ap_dns_arg.dns_str = arg_str1(NULL, NULL, "<dns>", "DNS server IP (empty string to clear)");
+    set_ap_dns_arg.end = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command = "set_ap_dns",
+        .help = "Set DNS server for AP clients (empty to use upstream)",
+        .hint = NULL,
+        .func = &set_ap_dns,
+        .argtable = &set_ap_dns_arg
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_hostname' command */
+static struct {
+    struct arg_str *name;
+    struct arg_end *end;
+} set_hostname_arg;
+
+int set_hostname(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **) &set_hostname_arg);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, set_hostname_arg.end, argv[0]);
+        return 1;
+    }
+
+    const char *name = set_hostname_arg.name->sval[0];
+    preprocess_string((char*)name);
+
+    // Validate: max 32 chars, only alphanumeric and hyphens (RFC 952)
+    size_t len = strlen(name);
+    if (len > 32) {
+        printf("Hostname too long (max 32 characters).\n");
+        return 1;
+    }
+    for (size_t i = 0; i < len; i++) {
+        char c = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-')) {
+            printf("Invalid character '%c'. Use only letters, digits, and hyphens.\n", c);
+            return 1;
+        }
+    }
+
+    esp_err_t err = set_config_param_str("hostname", name);
+    if (err != ESP_OK) {
+        printf("Error saving hostname: %s\n", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Hostname set to '%s'", name);
+    if (len > 0) {
+        printf("Hostname set to: %s\n", name);
+    } else {
+        printf("Hostname cleared (will use default 'espressif').\n");
+    }
+    printf("Restart to apply.\n");
+
+    free(hostname);
+    hostname = strdup(name);
+
+    return err;
+}
+
+static void register_set_hostname(void)
+{
+    set_hostname_arg.name = arg_str1(NULL, NULL, "<name>", "DHCP hostname (empty to clear)");
+    set_hostname_arg.end = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command = "set_hostname",
+        .help = "Set DHCP client hostname for upstream network (empty to use default)",
+        .hint = NULL,
+        .func = &set_hostname,
+        .argtable = &set_hostname_arg
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* Format web UI bind mask as a string, e.g. "AP STA " (or "AP ETH " for ETH_UPLINK) */
+static void fmt_web_bind(uint8_t bind, char *buf)
+{
+    buf[0] = '\0';
+    if (bind & RC_BIND_AP)  strcat(buf, "AP ");
+#if CONFIG_ETH_UPLINK
+    if (bind & RC_BIND_STA) strcat(buf, "ETH ");
+#else
+    if (bind & RC_BIND_STA) strcat(buf, "STA ");
+#endif
+    if (bind & RC_BIND_VPN) strcat(buf, "VPN ");
+    if (buf[0] == '\0') strcpy(buf, "(none)");
+}
+
+/* 'web_ui' command */
+static int web_ui_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        /* Show current status */
+        char* lock = NULL;
+        get_config_param_str("web_disabled", &lock);
+        bool enabled = (lock == NULL || strcmp(lock, "0") == 0);
+        int port = 80;
+        get_config_param_int("web_port", &port);
+        char bind_str[20];
+        fmt_web_bind(web_ui_get_bind(), bind_str);
+        printf("Web interface: %s (port %d, bind: %s)\n", enabled ? "enabled" : "disabled", port, bind_str);
+        printf("\nUsage:\n");
+        printf("  web_ui enable                     - Enable web interface (after reboot)\n");
+        printf("  web_ui disable                    - Disable web interface (after reboot)\n");
+        printf("  web_ui port <port>                - Set web server port (after reboot)\n");
+#if CONFIG_ETH_UPLINK
+        printf("  web_ui bind <ap|eth|vpn|all>      - Set allowed interfaces (takes effect immediately)\n");
+#else
+        printf("  web_ui bind <ap|sta|vpn|all>      - Set allowed interfaces (takes effect immediately)\n");
+#endif
+        if (lock != NULL) free(lock);
+        return 0;
+    }
+
+    const char *action = argv[1];
+    esp_err_t err = ESP_OK;
+
+    if (strcmp(action, "enable") == 0) {
+        err = set_config_param_str("web_disabled", "0");
+        if (err == ESP_OK) {
+            ESP_LOGW(TAG, "Web interface enabled via CLI.");
+            printf("Web interface will be enabled after reboot.\n");
+        }
+    } else if (strcmp(action, "disable") == 0) {
+        err = set_config_param_str("web_disabled", "1");
+        if (err == ESP_OK) {
+            ESP_LOGW(TAG, "Web interface disabled via CLI.");
+            printf("Web interface will be disabled after reboot.\n");
+            printf("Use 'web_ui enable' to re-enable it.\n");
+        }
+    } else if (strcmp(action, "port") == 0) {
+        if (argc < 3) {
+            int port = 80;
+            get_config_param_int("web_port", &port);
+            printf("Current web server port: %d\n", port);
+            printf("Usage: web_ui port <port>\n");
+            return 0;
+        }
+        int port = atoi(argv[2]);
+        if (port < 1 || port > 65535) {
+            printf("Invalid port: %s (must be 1-65535)\n", argv[2]);
+            return 1;
+        }
+        err = set_config_param_int("web_port", port);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Web server port set to %d.", port);
+            printf("Web server port set to %d (after reboot).\n", port);
+        }
+    } else if (strcmp(action, "bind") == 0) {
+        if (argc < 3) {
+            char bind_str[20];
+            fmt_web_bind(web_ui_get_bind(), bind_str);
+            printf("Current web UI bind: %s\n", bind_str);
+#if CONFIG_ETH_UPLINK
+            printf("Usage: web_ui bind <ap|eth|vpn|all>\n");
+            printf("  Interfaces may be comma-separated: web_ui bind ap,eth\n");
+#else
+            printf("Usage: web_ui bind <ap|sta|vpn|all>\n");
+            printf("  Interfaces may be comma-separated: web_ui bind ap,sta\n");
+#endif
+            return 0;
+        }
+        /* Parse comma-separated interface list or "all" */
+        uint8_t bind = 0;
+        char arg[64];
+        strlcpy(arg, argv[2], sizeof(arg));
+        if (strcmp(arg, "all") == 0) {
+            bind = RC_BIND_AP | RC_BIND_STA | RC_BIND_VPN;
+        } else {
+            char *tok = strtok(arg, ",");
+            while (tok) {
+                if      (strcmp(tok, "ap") == 0 || strcmp(tok, "AP") == 0)   bind |= RC_BIND_AP;
+#if CONFIG_ETH_UPLINK
+                else if (strcmp(tok, "eth") == 0 || strcmp(tok, "ETH") == 0) bind |= RC_BIND_STA;
+#else
+                else if (strcmp(tok, "sta") == 0 || strcmp(tok, "STA") == 0) bind |= RC_BIND_STA;
+#endif
+                else if (strcmp(tok, "vpn") == 0 || strcmp(tok, "VPN") == 0) bind |= RC_BIND_VPN;
+                else {
+#if CONFIG_ETH_UPLINK
+                    printf("Unknown interface '%s' (valid: ap, eth, vpn, all)\n", tok);
+#else
+                    printf("Unknown interface '%s' (valid: ap, sta, vpn, all)\n", tok);
+#endif
+                    return 1;
+                }
+                tok = strtok(NULL, ",");
+            }
+        }
+        if (bind == 0) {
+            printf("At least one interface required, defaulting to ap.\n");
+            bind = RC_BIND_AP;
+        }
+        web_ui_set_bind(bind);
+        char bind_str[20];
+        fmt_web_bind(bind, bind_str);
+        printf("Web UI access restricted to: %s(takes effect immediately)\n", bind_str);
+    } else {
+        printf("Unknown action: %s\n", action);
+        printf("Usage: web_ui <enable|disable|port|bind>\n");
+        return 1;
+    }
+
+    return err;
+}
+
+static void register_web_ui(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "web_ui",
+        .help = "Manage the web interface\n"
+                "  web_ui                         - Show current status\n"
+                "  web_ui enable                  - Enable web interface (after reboot)\n"
+                "  web_ui disable                 - Disable web interface (after reboot)\n"
+                "  web_ui port <port>             - Set web server port (after reboot)\n"
+#if CONFIG_ETH_UPLINK
+                "  web_ui bind <ap|eth|vpn|all>   - Set allowed interfaces (immediate)",
+        .hint = " <enable|disable|port|bind>",
+#else
+                "  web_ui bind <ap|sta|vpn|all>   - Set allowed interfaces (immediate)",
+        .hint = " <enable|disable|port|bind>",
+#endif
+        .func = &web_ui_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* --- Password hashing (SHA-256 + 16-byte salt) --- */
+/* NVS key "web_password" stores "salt_hex:hash_hex" (32 + 1 + 64 = 97 chars) */
+
+#define PW_SALT_LEN 16
+#define PW_HASH_LEN 32   /* SHA-256 output */
+
+static void pw_bytes_to_hex(const uint8_t *src, size_t len, char *out)
+{
+    for (size_t i = 0; i < len; i++) {
+        sprintf(out + i * 2, "%02x", src[i]);
+    }
+    out[len * 2] = '\0';
+}
+
+static int pw_hex_to_bytes(const char *src, uint8_t *dst, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        unsigned int b;
+        if (sscanf(src + i * 2, "%2x", &b) != 1) return -1;
+        dst[i] = (uint8_t)b;
+    }
+    return 0;
+}
+
+static void pw_compute_hash(const uint8_t *salt, size_t salt_len,
+                            const char *plaintext, uint8_t *hash_out)
+{
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);  /* 0 = SHA-256 (not 224) */
+    mbedtls_sha256_update(&ctx, salt, salt_len);
+    mbedtls_sha256_update(&ctx, (const uint8_t *)plaintext, strlen(plaintext));
+    mbedtls_sha256_finish(&ctx, hash_out);
+    mbedtls_sha256_free(&ctx);
+}
+
+bool is_web_password_set(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(PARAM_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return false;
+
+    size_t len = 0;
+    esp_err_t err = nvs_get_str(nvs, "web_password", NULL, &len);
+    nvs_close(nvs);
+    return (err == ESP_OK && len > 1);  /* len includes null terminator */
+}
+
+bool verify_web_password(const char *plaintext)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(PARAM_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return false;
+
+    size_t stored_len = 0;
+    esp_err_t err = nvs_get_str(nvs, "web_password", NULL, &stored_len);
+    if (err != ESP_OK || stored_len <= 1) { nvs_close(nvs); return false; }
+
+    char *stored = malloc(stored_len);
+    if (!stored) { nvs_close(nvs); return false; }
+    nvs_get_str(nvs, "web_password", stored, &stored_len);
+    nvs_close(nvs);
+
+    /* New format: "salt_hex:hash_hex" (32 + 1 + 64 = 97 chars + null) */
+    char *colon = strchr(stored, ':');
+    if (colon && (colon - stored) == PW_SALT_LEN * 2
+              && strlen(colon + 1) == PW_HASH_LEN * 2) {
+        /* Hashed format */
+        uint8_t salt[PW_SALT_LEN], stored_hash[PW_HASH_LEN], computed_hash[PW_HASH_LEN];
+        if (pw_hex_to_bytes(stored, salt, PW_SALT_LEN) != 0 ||
+            pw_hex_to_bytes(colon + 1, stored_hash, PW_HASH_LEN) != 0) {
+            free(stored);
+            return false;
+        }
+        pw_compute_hash(salt, PW_SALT_LEN, plaintext, computed_hash);
+        free(stored);
+
+        /* Constant-time comparison */
+        volatile int diff = 0;
+        for (int i = 0; i < PW_HASH_LEN; i++) {
+            diff |= stored_hash[i] ^ computed_hash[i];
+        }
+        return diff == 0;
+    }
+
+    /* Legacy plaintext format - compare directly, then migrate */
+    bool match = (strcmp(stored, plaintext) == 0);
+    free(stored);
+    if (match) {
+        /* Silently migrate to hashed format */
+        set_web_password_hashed(plaintext);
+    }
+    return match;
+}
+
+esp_err_t set_web_password_hashed(const char *plaintext)
+{
+    if (plaintext[0] == '\0') {
+        /* Empty = disable password */
+        return set_config_param_str("web_password", "");
+    }
+
+    uint8_t salt[PW_SALT_LEN], hash[PW_HASH_LEN];
+    esp_fill_random(salt, PW_SALT_LEN);
+    pw_compute_hash(salt, PW_SALT_LEN, plaintext, hash);
+
+    /* Format: "salt_hex:hash_hex" */
+    char buf[PW_SALT_LEN * 2 + 1 + PW_HASH_LEN * 2 + 1];
+    pw_bytes_to_hex(salt, PW_SALT_LEN, buf);
+    buf[PW_SALT_LEN * 2] = ':';
+    pw_bytes_to_hex(hash, PW_HASH_LEN, buf + PW_SALT_LEN * 2 + 1);
+
+    return set_config_param_str("web_password", buf);
+}
+
+/* 'set_router_password' command */
+static int set_router_password_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: set_router_password <password>\n");
+        printf("Use empty string \"\" to disable password protection\n");
+        return 1;
+    }
+
+    esp_err_t err = set_web_password_hashed(argv[1]);
+    if (err == ESP_OK) {
+        if (argv[1][0] == '\0') {
+            ESP_LOGW(TAG, "Web password protection disabled via CLI.");
+            printf("Password protection disabled.\n");
+        } else {
+            ESP_LOGW(TAG, "Web password changed via CLI.");
+            printf("Password updated successfully.\n");
+        }
+    } else {
+        printf("Failed to set password\n");
+    }
+    return err;
+}
+
+static void register_set_router_password(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_router_password",
+        .help = "Set router password for web and remote console (empty string to disable)",
+        .hint = NULL,
+        .func = &set_router_password_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/** Arguments used by 'portmap' function */
+static struct {
+    struct arg_str *add_del;
+    struct arg_str *TCP_UDP;
+    struct arg_int *ext_port;
+    struct arg_str *int_ip;
+    struct arg_int *int_port;
+    struct arg_str *iface;
+    struct arg_end *end;
+} portmap_args;
+
+/* 'portmap' command */
+int portmap(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **) &portmap_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, portmap_args.end, argv[0]);
+        return 1;
+    }
+
+    bool add;
+    if (strcmp((char *)portmap_args.add_del->sval[0], "add")== 0) {
+        add = true;
+    } else if (strcmp((char *)portmap_args.add_del->sval[0], "del")== 0) {
+        add = false;
+    } else {
+        printf("Must be 'add' or 'del'\n");
+        return 1;
+    }
+
+    uint8_t tcp_udp;
+    if (strcmp((char *)portmap_args.TCP_UDP->sval[0], "TCP")== 0) {
+        tcp_udp = PROTO_TCP;
+    } else if (strcmp((char *)portmap_args.TCP_UDP->sval[0], "UDP")== 0) {
+        tcp_udp = PROTO_UDP;
+    } else {
+        printf("Must be 'TCP' or 'UDP'\n");
+        return 1;
+    }
+
+    uint16_t ext_port = portmap_args.ext_port->ival[0];
+    const char *ip_str = (char *)portmap_args.int_ip->sval[0];
+    uint32_t int_ip = esp_ip4addr_aton(ip_str);
+
+    /* If IP parsing failed (returns IPADDR_NONE), try device name */
+    if (int_ip == IPADDR_NONE) {
+        if (!resolve_device_name_to_ip(ip_str, &int_ip)) {
+            printf("Invalid IP address or device name: %s\n", ip_str);
+            return 1;
+        }
+    }
+    uint16_t int_port = portmap_args.int_port->ival[0];
+
+    if (add) {
+        /* Validate internal IP is in same /24 network as AP interface */
+        if ((int_ip & 0x00FFFFFF) != (my_ap_ip & 0x00FFFFFF)) {
+            ip4_addr_t ap_addr, int_addr;
+            ap_addr.addr = my_ap_ip;
+            int_addr.addr = int_ip;
+            printf("Internal IP " IPSTR " must be in same network as AP (" IPSTR "/24)\n",
+                   IP2STR(&int_addr), IP2STR(&ap_addr));
+            return 1;
+        }
+
+        /* Check if external port is already in use for this protocol */
+        for (int i = 0; i < IP_PORTMAP_MAX; i++) {
+            if (portmap_tab[i].valid &&
+                portmap_tab[i].proto == tcp_udp &&
+                portmap_tab[i].mport == ext_port) {
+                printf("External port %d/%s is already mapped\n",
+                       ext_port, tcp_udp == PROTO_TCP ? "TCP" : "UDP");
+                return 1;
+            }
+        }
+
+        uint8_t iface = 0;  // Default: STA/ETH (uplink)
+        if (portmap_args.iface->count > 0) {
+            if (strcasecmp(portmap_args.iface->sval[0], "VPN") == 0) {
+                iface = 1;
+#if CONFIG_ETH_UPLINK
+            } else if (strcasecmp(portmap_args.iface->sval[0], "ETH") != 0) {
+                printf("Interface must be 'ETH' or 'VPN'\n");
+#else
+            } else if (strcasecmp(portmap_args.iface->sval[0], "STA") != 0) {
+                printf("Interface must be 'STA' or 'VPN'\n");
+#endif
+                return 1;
+            }
+        }
+
+        add_portmap(tcp_udp, ext_port, int_ip, int_port, iface);
+    } else {
+        del_portmap(tcp_udp, ext_port);
+    }
+
+    return ESP_OK;
+}
+
+static void register_portmap(void)
+{
+    portmap_args.add_del = arg_str1(NULL, NULL, "[add|del]", "add or delete portmapping");
+    portmap_args.TCP_UDP = arg_str1(NULL, NULL, "[TCP|UDP]", "TCP or UDP port");
+    portmap_args.ext_port = arg_int1(NULL, NULL, "<ext_portno>", "external port number");
+    portmap_args.int_ip = arg_str1(NULL, NULL, "<int_ip>", "internal IP or device name");
+    portmap_args.int_port = arg_int1(NULL, NULL, "<int_portno>", "internal port number");
+#if CONFIG_ETH_UPLINK
+    portmap_args.iface = arg_str0(NULL, NULL, "[ETH|VPN]", "interface (default: ETH)");
+#else
+    portmap_args.iface = arg_str0(NULL, NULL, "[STA|VPN]", "interface (default: STA)");
+#endif
+    portmap_args.end = arg_end(6);
+
+    const esp_console_cmd_t cmd = {
+        .command = "portmap",
+        .help = "Add or delete a portmapping to the router",
+        .hint = NULL,
+        .func = &portmap,
+        .argtable = &portmap_args
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'show' command arguments */
+static struct {
+    struct arg_str *type;
+    struct arg_end *end;
+} show_args;
+
+/* Snapshot of the lwIP netif list for 'show routes'. Taken on the tcpip thread
+ * (esp_netif_tcpip_exec) so it is consistent even without core locking, which
+ * is off in our sdkconfigs; printing happens afterwards in the console task. */
+#define ROUTE_SNAP_MAX 8
+
+typedef struct {
+    char name[6];
+    ip4_addr_t ip, mask, gw;
+    bool up, link, is_default;
+} route_snap_t;
+
+typedef struct {
+    route_snap_t e[ROUTE_SNAP_MAX];
+    int n;
+} route_snap_list_t;
+
+static esp_err_t route_snapshot_cb(void *ctx)
+{
+    route_snap_list_t *l = (route_snap_list_t *)ctx;
+    struct netif *nif;
+
+    l->n = 0;
+    NETIF_FOREACH(nif) {
+        if (l->n >= ROUTE_SNAP_MAX) {
+            break;
+        }
+        route_snap_t *s = &l->e[l->n++];
+        snprintf(s->name, sizeof(s->name), "%c%c%u", nif->name[0], nif->name[1], (unsigned)nif->num);
+        ip4_addr_copy(s->ip, *netif_ip4_addr(nif));
+        ip4_addr_copy(s->mask, *netif_ip4_netmask(nif));
+        ip4_addr_copy(s->gw, *netif_ip4_gw(nif));
+        s->up = netif_is_up(nif);
+        s->link = netif_is_link_up(nif);
+        s->is_default = (nif == netif_default);
+    }
+    return ESP_OK;
+}
+
+/* 'show' command implementation */
+static int show(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **) &show_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, show_args.end, argv[0]);
+        return 1;
+    }
+
+    if (show_args.type->count == 0) {
+        printf("Usage: show <status|config|mappings|acl|vpn|routes|ota>\n");
+        printf("  status   - Show router status (connection, clients, memory)\n");
+        printf("  config   - Show router configuration (AP/STA settings)\n");
+        printf("  mappings - Show DHCP pool, reservations and port mappings\n");
+        printf("  acl      - Show firewall ACL rules\n");
+        printf("  vpn      - Show WireGuard VPN status and config\n");
+        printf("  routes   - Show network interfaces and the default route\n");
+        printf("  ota      - Show firmware and OTA partition info\n");
+        return 1;
+    }
+
+    const char *type = show_args.type->sval[0];
+
+    if (strcmp(type, "status") == 0) {
+        // Show status
+        printf("Router Status:\n");
+        printf("==============\n");
+
+        // Uptime
+        char uptime_str[32];
+        format_uptime(get_uptime_seconds(), uptime_str, sizeof(uptime_str));
+        char boot_time_str[32];
+        format_boot_time(boot_time_str, sizeof(boot_time_str));
+        printf("Uptime: %s (since %s)\n", uptime_str, boot_time_str);
+
+        // Connection status
+#if CONFIG_ETH_UPLINK
+        if (ap_connect) {
+            printf("Uplink ETH: connected\n");
+        } else {
+            printf("Uplink ETH: not connected\n");
+        }
+#else
+        if (ap_connect) {
+            wifi_ap_record_t ap_info;
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+#if WIFI_HAS_5GHZ
+                printf("Uplink STA: connected (ch %d, %s, %d dBm)\n",
+                       ap_info.primary,
+                       ap_info.primary > 14 ? "5 GHz" : "2.4 GHz",
+                       ap_info.rssi);
+#else
+                printf("Uplink AP: connected (ch %d, %d dBm)\n", ap_info.primary, ap_info.rssi);
+#endif
+            } else {
+                printf("Uplink AP: connected\n");
+            }
+        } else {
+            printf("Uplink AP: not connected\n");
+        }
+#endif
+        if (ap_connect) {
+            ip4_addr_t addr;
+            addr.addr = my_ip;
+            printf("Uplink IP: " IPSTR "\n", IP2STR(&addr));
+        } else {
+            printf("Uplink IP: none\n");
+        }
+
+        // AP interface state
+        printf("AP interface: %s\n", ap_disabled ? "disabled" : "enabled");
+
+        // Connected clients
+        resync_connect_count();
+        printf("Connected clients: %u\n", connect_count);
+
+        // Byte counts
+        char _sent_buf[16], _recv_buf[16];
+        format_bytes_human(get_sta_bytes_sent(), _sent_buf, sizeof(_sent_buf));
+        format_bytes_human(get_sta_bytes_received(), _recv_buf, sizeof(_recv_buf));
+        printf("Bytes sent/received: %s / %s\n", _sent_buf, _recv_buf);
+
+
+#if SOC_TEMP_SENSOR_SUPPORTED
+        // CPU temperature
+        {
+            temperature_sensor_handle_t tsens;
+            temperature_sensor_config_t tsens_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
+            //temperature_sensor_config_t tsens_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+            if (temperature_sensor_install(&tsens_cfg, &tsens) == ESP_OK) {
+                float celsius = 0.0f;
+                temperature_sensor_enable(tsens);
+                if (temperature_sensor_get_celsius(tsens, &celsius) == ESP_OK) {
+                    printf("CPU temperature: %.1f °C\n", celsius);
+                }
+                temperature_sensor_disable(tsens);
+                temperature_sensor_uninstall(tsens);
+            }
+        }
+#endif
+        // Free heap
+        printf("Free heap: %lu bytes\n", (unsigned long)esp_get_free_heap_size());
+
+        if (connect_count > 0) {
+            connected_client_t clients[8];
+            int count = get_connected_clients(clients, 8);
+
+            if (count > 0) {
+                // Fetch per-client traffic stats only when enabled
+                client_stats_entry_t stats[CLIENT_STATS_MAX];
+                int stats_count = client_stats_enabled ? client_stats_get_all(stats, CLIENT_STATS_MAX) : 0;
+
+                printf("\nClient Details:\n");
+                if (client_stats_enabled) {
+                    printf("MAC Address       IP Address       Device Name          TX / RX\n");
+                    printf("----------------  ---------------  -------------------  ------------------\n");
+                } else {
+                    printf("MAC Address       IP Address       Device Name\n");
+                    printf("----------------  ---------------  -------------------\n");
+                }
+
+                for (int i = 0; i < count; i++) {
+                    char mac_str[18];
+                    sprintf(mac_str, "%02X:%02X:%02X:%02X:%02X:%02X",
+                            clients[i].mac[0], clients[i].mac[1], clients[i].mac[2],
+                            clients[i].mac[3], clients[i].mac[4], clients[i].mac[5]);
+
+                    char ip_str[16] = "N/A";
+                    if (clients[i].has_ip) {
+                        ip4_addr_t addr;
+                        addr.addr = clients[i].ip;
+                        sprintf(ip_str, IPSTR, IP2STR(&addr));
+                    }
+
+                    if (client_stats_enabled) {
+                        char traffic_str[32] = "-";
+                        for (int j = 0; j < stats_count; j++) {
+                            if (memcmp(stats[j].mac, clients[i].mac, 6) == 0) {
+                                char tx_buf[12], rx_buf[12];
+                                format_bytes_human(stats[j].bytes_sent, tx_buf, sizeof(tx_buf));
+                                format_bytes_human(stats[j].bytes_received, rx_buf, sizeof(rx_buf));
+                                snprintf(traffic_str, sizeof(traffic_str), "%s / %s", tx_buf, rx_buf);
+                                break;
+                            }
+                        }
+                        printf("%-17s  %-15s  %-19s  %s\n", mac_str, ip_str, clients[i].name, traffic_str);
+                    } else {
+                        printf("%-17s  %-15s  %s\n", mac_str, ip_str, clients[i].name);
+                    }
+                }
+            }
+        }
+        
+    } else if (strcmp(type, "config") == 0) {
+        // Show config
+        char* static_ip = NULL;
+        char* subnet_mask = NULL;
+        char* gateway_addr = NULL;
+        char* ap_ssid = NULL;
+        char* ap_passwd = NULL;
+
+        get_config_param_str("static_ip", &static_ip);
+        get_config_param_str("subnet_mask", &subnet_mask);
+        get_config_param_str("gateway_addr", &gateway_addr);
+        get_config_param_str("ap_ssid", &ap_ssid);
+        get_config_param_str("ap_passwd", &ap_passwd);
+
+        printf("Router Configuration:\n");
+        printf("====================\n");
+
+        bool hide_pw = remote_console_is_capturing();
+#if CONFIG_ETH_UPLINK
+        printf("Uplink: Ethernet (LAN8720)\n");
+#else
+        char* ssid = NULL;
+        char* ent_username = NULL;
+        char* ent_identity = NULL;
+        char* passwd = NULL;
+        get_config_param_str("ssid", &ssid);
+        get_config_param_str("ent_username", &ent_username);
+        get_config_param_str("ent_identity", &ent_identity);
+        get_config_param_str("passwd", &passwd);
+
+        printf("STA Settings:\n");
+        printf("  SSID: %s\n", ssid != NULL ? ssid : "<undef>");
+        printf("  Password: %s\n", passwd == NULL ? "<undef>" : hide_pw ? "***" : passwd);
+        if ((ent_username != NULL) && (strlen(ent_username) > 0)) {
+            printf("  Enterprise Username: %s\n", ent_username);
+            if ((ent_identity != NULL) && (strlen(ent_identity) > 0)) {
+                printf("  Enterprise Identity: %s\n", ent_identity);
+            }
+            const char* eap_names[] = {"Auto", "PEAP", "TTLS", "TLS"};
+            const char* phase2_names[] = {"MSCHAPv2", "MSCHAP", "PAP", "CHAP"};
+            printf("  EAP Method: %s\n", (eap_method >= 0 && eap_method <= 3) ? eap_names[eap_method] : "Unknown");
+            printf("  TTLS Phase 2: %s\n", (ttls_phase2 >= 0 && ttls_phase2 <= 3) ? phase2_names[ttls_phase2] : "Unknown");
+            printf("  CA Cert Bundle: %s\n", use_cert_bundle ? "enabled" : "disabled");
+            printf("  Time Check: %s\n", disable_time_check ? "disabled" : "enabled");
+        } else {
+            printf("  Enterprise: <not active>\n");
+        }
+
+
+#if WIFI_HAS_5GHZ
+        {
+            const char *band_names[] = {"auto", "2.4 GHz", "5 GHz"};
+            printf("  Band preference: %s\n", band_names[sta_band <= STA_BAND_5G ? sta_band : 0]);
+        }
+#endif
+
+        if (ssid != NULL) free(ssid);
+        if (ent_username != NULL) free(ent_username);
+        if (ent_identity != NULL) free(ent_identity);
+        if (passwd != NULL) free(passwd);
+#endif
+
+        if (static_ip != NULL && strlen(static_ip) > 0) {
+            printf("  Static IP: %s\n", static_ip);
+            printf("  Subnet Mask: %s\n", subnet_mask != NULL ? subnet_mask : "<undef>");
+            printf("  Gateway: %s\n", gateway_addr != NULL ? gateway_addr : "<undef>");
+        } else {
+            printf("  Static IP: <not configured>\n");
+        }
+        printf("  Hostname: %s\n", hostname);
+
+        printf("\nAP Settings:\n");
+        printf("  SSID: %s\n", ap_ssid != NULL ? ap_ssid : "<undef>");
+        printf("  Password: %s\n", ap_passwd == NULL ? "<undef>" : hide_pw ? "***" : ap_passwd);
+        ip4_addr_t addr;
+        addr.addr = my_ap_ip;
+        printf("  IP Address: " IPSTR "\n", IP2STR(&addr));
+        printf("  DNS Server: %s\n", (ap_dns && ap_dns[0]) ? ap_dns : "(upstream)");
+        {
+            const char *auth_modes[] = {"WPA2/WPA3", "WPA2", "WPA3"};
+            printf("  Security: %s\n", auth_modes[ap_authmode <= 2 ? ap_authmode : 0]);
+        }
+#if CONFIG_ETH_UPLINK
+        printf("  Channel: %s", ap_channel > 0 ? "" : "auto\n");
+        if (ap_channel > 0) printf("%d\n", ap_channel);
+#endif
+
+        char* web_lock = NULL;
+        get_config_param_str("web_disabled", &web_lock);
+        bool web_enabled = (web_lock == NULL || strcmp(web_lock, "0") == 0);
+        int web_port = 80;
+        get_config_param_int("web_port", &web_port);
+        char web_bind_buf[20];
+        fmt_web_bind(web_ui_get_bind(), web_bind_buf);
+        printf("\nWeb Interface: %s (port %d, bind: %s)\n", web_enabled ? "enabled" : "disabled", web_port, web_bind_buf);
+        if (web_lock != NULL) free(web_lock);
+
+        int8_t tx_power = 0;
+        if (esp_wifi_get_max_tx_power(&tx_power) == ESP_OK) {
+            printf("TX Power: %.1f dBm\n", tx_power * 0.25);
+        }
+        printf("Country Code: %s\n", wifi_country_code);
+
+        // Cleanup
+        if (static_ip != NULL) free(static_ip);
+        if (subnet_mask != NULL) free(subnet_mask);
+        if (gateway_addr != NULL) free(gateway_addr);
+        if (ap_ssid != NULL) free(ap_ssid);
+        if (ap_passwd != NULL) free(ap_passwd);
+        
+    } else if (strcmp(type, "mappings") == 0) {
+        // Show mappings
+        printf("Network Mappings:\n");
+        printf("=================\n");
+
+        printf("\nDHCP Pool:\n");
+        print_dhcp_pool();
+
+        printf("\nDHCP Reservations (known clients only: %s):\n", ap_known_only ? "on" : "off");
+        print_dhcp_reservations();
+
+        printf("\nPort Mappings:\n");
+        print_portmap_tab();
+
+    } else if (strcmp(type, "acl") == 0) {
+        // Show ACL rules with device names
+        printf("Firewall ACL Rules:\n");
+        printf("===================\n");
+
+        for (int i = 0; i < MAX_ACL_LISTS; i++) {
+            acl_print_with_names(i);
+        }
+
+    } else if (strcmp(type, "vpn") == 0) {
+        printf("WireGuard VPN:\n");
+        printf("==============\n");
+        printf("Enabled: %s\n", vpn_enabled ? "yes" : "no");
+        if (vpn_enabled) {
+            const char *state;
+            if (vpn_is_connected()) {
+                state = "peer up";
+            } else if (vpn_connected) {
+                state = "handshake pending";
+            } else {
+                state = "disconnected";
+            }
+            printf("Status: %s\n", state);
+        } else {
+            printf("Status: disabled\n");
+        }
+        printf("Tunnel IP: %s\n", (vpn_address && vpn_address[0]) ? vpn_address : "<not set>");
+        printf("Netmask: %s\n", (vpn_netmask && vpn_netmask[0]) ? vpn_netmask : "255.255.255.0");
+        printf("Endpoint: %s:%ld\n", (vpn_endpoint && vpn_endpoint[0]) ? vpn_endpoint : "<not set>", (long)vpn_port);
+        printf("Keepalive: %ld sec\n", (long)vpn_keepalive);
+        printf("MTU: %ld\n", (long)vpn_mtu);
+        printf("Private Key: %s\n", (vpn_private_key && vpn_private_key[0]) ? "<set>" : "<not set>");
+        printf("Public Key: %s\n", (vpn_public_key && vpn_public_key[0]) ? vpn_public_key : "<not set>");
+        printf("Preshared Key: %s\n", (vpn_preshared_key && vpn_preshared_key[0]) ? "<set>" : "<not set>");
+        printf("MSS Clamp: %u\n", ap_mss_clamp);
+        printf("Path MTU: %u\n", ap_pmtu);
+        printf("Kill Switch: %s\n", vpn_killswitch ? "on" : "off");
+        printf("Route All: %s\n", vpn_route_all ? "yes (all traffic)" : "no (split tunnel)");
+
+    } else if (strcmp(type, "routes") == 0) {
+        /* lwIP has no routing table: a packet leaves through the first up
+         * interface whose subnet contains the destination, otherwise through
+         * netif_default. Snapshot on the tcpip thread, print afterwards. */
+        static route_snap_list_t snap;  // keep off the console task stack
+        const route_snap_t *rt = snap.e;
+
+        if (esp_netif_tcpip_exec(route_snapshot_cb, &snap) != ESP_OK) {
+            printf("Failed to read interface list\n");
+            return 1;
+        }
+        int n = snap.n;
+
+        printf("Iface  Address             Gateway          State\n");
+        printf("-----  ------------------  ---------------  ---------------------\n");
+        for (int i = 0; i < n; i++) {
+            char addr[24], gw[16];
+            int prefix = __builtin_popcount(lwip_ntohl(ip4_addr_get_u32(&rt[i].mask)));
+            snprintf(addr, sizeof(addr), IPSTR "/%d", IP2STR(&rt[i].ip), prefix);
+            if (ip4_addr_isany_val(rt[i].gw)) {
+                strcpy(gw, "-");
+            } else {
+                snprintf(gw, sizeof(gw), IPSTR, IP2STR(&rt[i].gw));
+            }
+            printf("%-5s  %-18s  %-15s  %s%s%s\n", rt[i].name, addr, gw,
+                   rt[i].up ? "up" : "down",
+                   rt[i].link ? "" : " (no link)",
+                   rt[i].is_default ? "  * default" : "");
+        }
+        if (n == 0) {
+            printf("No interfaces\n");
+        }
+
+    } else if (strcmp(type, "ota") == 0) {
+        const esp_partition_t *running = esp_ota_get_running_partition();
+        const esp_app_desc_t *app_desc = esp_app_get_description();
+        const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+        const esp_partition_t *last = esp_ota_get_last_invalid_partition();
+
+        printf("Running partition: %s (0x%lx, %luK)\n",
+            running ? running->label : "unknown",
+            running ? (unsigned long)running->address : 0,
+            running ? (unsigned long)running->size / 1024 : 0);
+        printf("Firmware version: %s\n", app_desc ? app_desc->version : "unknown");
+        printf("Built: %s %s\n",
+            app_desc ? app_desc->date : "unknown",
+            app_desc ? app_desc->time : "");
+        printf("IDF version: %s\n", app_desc ? app_desc->idf_ver : "unknown");
+        printf("Next OTA partition: %s (0x%lx, %luK)\n",
+            next ? next->label : "none",
+            next ? (unsigned long)next->address : 0,
+            next ? (unsigned long)next->size / 1024 : 0);
+
+        if (last) {
+            printf("Last invalid partition: %s\n", last->label);
+        }
+
+        esp_ota_img_states_t ota_state;
+        if (running && esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+            const char *state_str = "unknown";
+            switch (ota_state) {
+                case ESP_OTA_IMG_NEW:             state_str = "new (first boot pending)"; break;
+                case ESP_OTA_IMG_PENDING_VERIFY:  state_str = "pending verify"; break;
+                case ESP_OTA_IMG_VALID:           state_str = "valid"; break;
+                case ESP_OTA_IMG_INVALID:         state_str = "invalid"; break;
+                case ESP_OTA_IMG_ABORTED:         state_str = "aborted"; break;
+                default: break;
+            }
+            printf("Image state: %s\n", state_str);
+        }
+
+    } else {
+        printf("Invalid parameter. Use: show <status|config|mappings|acl|vpn|routes|ota>\n");
+        return 1;
+    }
+
+    return 0;
+}
+
+static void register_show(void)
+{
+    show_args.type = arg_str1(NULL, NULL, "[status|config|mappings|acl|vpn|routes|ota]", "Type of information");
+    show_args.end = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command = "show",
+        .help = "Show router status, config, mappings, ACL rules, VPN, routes or OTA info",
+        .hint = NULL,
+        .func = &show,
+        .argtable = &show_args
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/** Arguments used by 'dhcp_reserve' function */
+static struct {
+    struct arg_str *add_del;
+    struct arg_str *mac_addr;
+    struct arg_str *ip_addr;
+    struct arg_str *name;
+    struct arg_end *end;
+} dhcp_reserve_args;
+
+/* 'dhcp_reserve' command */
+int dhcp_reserve(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **) &dhcp_reserve_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, dhcp_reserve_args.end, argv[0]);
+        return 1;
+    }
+
+    int action; // 0 = add, 1 = del, 2 = block
+    if (strcmp((char *)dhcp_reserve_args.add_del->sval[0], "add") == 0) {
+        action = 0;
+    } else if (strcmp((char *)dhcp_reserve_args.add_del->sval[0], "del") == 0) {
+        action = 1;
+    } else if (strcmp((char *)dhcp_reserve_args.add_del->sval[0], "block") == 0) {
+        action = 2;
+    } else {
+        printf("Must be 'add', 'del', or 'block'\n");
+        return 1;
+    }
+
+    // Parse MAC address (AA:BB:CC:DD:EE:FF or AA-BB-CC-DD-EE-FF)
+    unsigned int mac[6];
+    const char *mac_str = dhcp_reserve_args.mac_addr->sval[0];
+    if (sscanf(mac_str, "%02x:%02x:%02x:%02x:%02x:%02x",
+               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) != 6 &&
+        sscanf(mac_str, "%02x-%02x-%02x-%02x-%02x-%02x",
+               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) != 6) {
+        printf("Invalid MAC address format. Use AA:BB:CC:DD:EE:FF\n");
+        return 1;
+    }
+
+    uint8_t mac_bytes[6];
+    for (int i = 0; i < 6; i++) {
+        mac_bytes[i] = (uint8_t)mac[i];
+    }
+
+    if (action == 2) {
+        // Block: add reservation with IP 0.0.0.0
+        const char *name = NULL;
+        if (dhcp_reserve_args.name->count > 0) {
+            name = dhcp_reserve_args.name->sval[0];
+        }
+
+        esp_err_t err = add_dhcp_reservation(mac_bytes, 0, name);
+        if (err == ESP_OK) {
+            printf("Client blocked\n");
+        } else if (err == ESP_ERR_NO_MEM) {
+            printf("No more slots available\n");
+            return 1;
+        } else {
+            printf("Failed to block client\n");
+            return 1;
+        }
+    } else if (action == 0) {
+        // Parse IP address
+        uint32_t ip = esp_ip4addr_aton((char *)dhcp_reserve_args.ip_addr->sval[0]);
+        if (ip == IPADDR_NONE) {
+            printf("Invalid IP address\n");
+            return 1;
+        }
+
+        // Validate IP is in same /24 network as AP interface
+        if (ip != 0 && (ip & 0x00FFFFFF) != (my_ap_ip & 0x00FFFFFF)) {
+            ip4_addr_t ap_addr, res_addr;
+            ap_addr.addr = my_ap_ip;
+            res_addr.addr = ip;
+            printf("IP " IPSTR " must be in same network as AP (" IPSTR "/24)\n",
+                   IP2STR(&res_addr), IP2STR(&ap_addr));
+            return 1;
+        }
+
+        // Get optional name
+        const char *name = NULL;
+        if (dhcp_reserve_args.name->count > 0) {
+            name = dhcp_reserve_args.name->sval[0];
+        }
+
+        esp_err_t err = add_dhcp_reservation(mac_bytes, ip, name);
+        if (err == ESP_OK) {
+            printf(ip == 0 ? "Client blocked\n" : "DHCP reservation added\n");
+        } else if (err == ESP_ERR_NO_MEM) {
+            printf("No more slots available for DHCP reservations\n");
+            return 1;
+        } else {
+            printf("Failed to add DHCP reservation\n");
+            return 1;
+        }
+    } else {
+        esp_err_t err = del_dhcp_reservation(mac_bytes);
+        if (err == ESP_OK) {
+            printf("DHCP reservation deleted\n");
+        } else {
+            printf("Failed to delete DHCP reservation\n");
+            return 1;
+        }
+    }
+
+    return ESP_OK;
+}
+
+static void register_dhcp_reserve(void)
+{
+    dhcp_reserve_args.add_del = arg_str1(NULL, NULL, "[add|del|block]", "add, delete, or block");
+    dhcp_reserve_args.mac_addr = arg_str1(NULL, NULL, "<mac>", "MAC address (AA:BB:CC:DD:EE:FF)");
+    dhcp_reserve_args.ip_addr = arg_str0(NULL, NULL, "<ip>", "IP address (required for add)");
+    dhcp_reserve_args.name = arg_str0("-n", "--name", "<name>", "optional device name");
+    dhcp_reserve_args.end = arg_end(4);
+
+    const esp_console_cmd_t cmd = {
+        .command = "dhcp_reserve",
+        .help = "Add/delete DHCP reservation or block a client by MAC",
+        .hint = NULL,
+        .func = &dhcp_reserve,
+        .argtable = &dhcp_reserve_args
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'bytes' command */
+static struct {
+    struct arg_str* action;
+    struct arg_end* end;
+} bytes_args;
+
+static int bytes(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **) &bytes_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, bytes_args.end, argv[0]);
+        return 1;
+    }
+
+    if (bytes_args.action->count == 0) {
+        // Show current byte counts
+        printf("STA Interface Byte Counts:\n");
+        printf("  Sent:     %" PRIu64 " bytes\n", get_sta_bytes_sent());
+        printf("  Received: %" PRIu64 " bytes\n", get_sta_bytes_received());
+        return 0;
+    }
+
+    const char *action = bytes_args.action->sval[0];
+    if (strcmp(action, "reset") == 0) {
+        reset_sta_byte_counts();
+        printf("Byte counts reset to zero\n");
+    } else {
+        printf("Usage: bytes [reset]\n");
+        printf("  bytes     - Show current byte counts\n");
+        printf("  bytes reset - Reset byte counts to zero\n");
+        return 1;
+    }
+
+    return 0;
+}
+
+static void register_bytes(void)
+{
+    bytes_args.action = arg_str0(NULL, NULL, "[reset]", "reset byte counts or show current counts");
+    bytes_args.end = arg_end(1);
+
+    const esp_console_cmd_t cmd = {
+        .command = "bytes",
+        .help = "Show or reset STA interface byte counts",
+        .hint = NULL,
+        .func = &bytes,
+        .argtable = &bytes_args
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'pcap' command arguments */
+static struct {
+    struct arg_str* action;
+    struct arg_str* mode;
+    struct arg_int* snaplen;
+    struct arg_end* end;
+} pcap_args;
+
+/* 'pcap' command implementation */
+static int pcap(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **) &pcap_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, pcap_args.end, argv[0]);
+        return 1;
+    }
+
+    if (pcap_args.action->count == 0) {
+        printf("Usage: pcap <action> [args]\n");
+        printf("  mode [off|acl|promisc] - Get or set capture mode\n");
+        printf("    off      - Capture disabled\n");
+        printf("    acl      - Capture ACL_MONITOR flagged packets (any interface)\n");
+        printf("    promisc  - Capture all AP client traffic (not STA)\n");
+        printf("  status     - Show capture status\n");
+        printf("  snaplen [n]- Get or set max capture bytes (64-1600)\n");
+        printf("  start      - Legacy: enable promiscuous mode\n");
+        printf("  stop       - Legacy: disable capture\n");
+        return 1;
+    }
+
+    const char *action = pcap_args.action->sval[0];
+
+    if (strcmp(action, "mode") == 0) {
+        if (pcap_args.mode->count > 0) {
+            const char *mode_str = pcap_args.mode->sval[0];
+            if (strcmp(mode_str, "off") == 0) {
+                pcap_set_mode(PCAP_MODE_OFF);
+                printf("Capture mode: off\n");
+            } else if (strcmp(mode_str, "acl") == 0) {
+                pcap_set_mode(PCAP_MODE_ACL_MONITOR);
+                printf("Capture mode: acl-monitor\n");
+                printf("Only packets matching ACL rules with +M flag will be captured (any interface)\n");
+            } else if (strcmp(mode_str, "promisc") == 0 || strcmp(mode_str, "promiscuous") == 0) {
+                pcap_set_mode(PCAP_MODE_PROMISCUOUS);
+                printf("Capture mode: promiscuous\n");
+                printf("All AP client traffic will be captured (STA excluded)\n");
+            } else {
+                printf("Invalid mode. Use: off, acl, or promisc\n");
+                return 1;
+            }
+            printf("Connect Wireshark to TCP port 19000\n");
+        } else {
+            printf("Current mode: %s\n", pcap_mode_to_string(pcap_get_mode()));
+        }
+    } else if (strcmp(action, "start") == 0) {
+        // Legacy: start = promiscuous mode
+        pcap_set_mode(PCAP_MODE_PROMISCUOUS);
+        printf("PCAP capture started in promiscuous mode (snaplen=%d)\n", pcap_get_snaplen());
+        printf("Connect Wireshark to TCP port 19000\n");
+    } else if (strcmp(action, "stop") == 0) {
+        // Legacy: stop = off mode
+        pcap_set_mode(PCAP_MODE_OFF);
+        printf("PCAP capture stopped\n");
+    } else if (strcmp(action, "snaplen") == 0) {
+        int val = 0;
+        bool has_value = false;
+
+        if (pcap_args.snaplen->count > 0) {
+            val = pcap_args.snaplen->ival[0];
+            has_value = true;
+        } else if (pcap_args.mode->count > 0) {
+            // argtable may have put the number in mode slot (string before int)
+            val = atoi(pcap_args.mode->sval[0]);
+            if (val > 0) has_value = true;
+        }
+
+        if (has_value) {
+            if (pcap_set_snaplen((uint16_t)val)) {
+                printf("Snaplen set to %d bytes\n", pcap_get_snaplen());
+            } else {
+                printf("Error: snaplen must be between 64 and 1600\n");
+                return 1;
+            }
+        } else {
+            printf("Current snaplen: %d bytes\n", pcap_get_snaplen());
+        }
+    } else if (strcmp(action, "status") == 0) {
+        printf("PCAP Capture Status:\n");
+        printf("====================\n");
+        printf("Mode:     %s\n", pcap_mode_to_string(pcap_get_mode()));
+        printf("Client:   %s\n", pcap_client_connected() ? "connected" : "not connected");
+        printf("Snaplen:  %d bytes\n", pcap_get_snaplen());
+
+        size_t used, total;
+        pcap_get_buffer_usage(&used, &total);
+        printf("Buffer:   %u / %u bytes (%.1f%%)\n",
+               (unsigned)used, (unsigned)total,
+               total > 0 ? (100.0f * used / total) : 0.0f);
+
+        printf("Captured: %lu packets\n", (unsigned long)pcap_get_captured_count());
+        printf("Dropped:  %lu packets\n", (unsigned long)pcap_get_dropped_count());
+        printf("\nConnection: nc <esp32_ip> 19000 | wireshark -k -i -\n");
+    } else {
+        printf("Invalid action. Use: pcap <mode|status|snaplen|start|stop>\n");
+        return 1;
+    }
+
+    return 0;
+}
+
+static void register_pcap(void)
+{
+    pcap_args.action = arg_str1(NULL, NULL, "<action>", "mode|status|snaplen|start|stop");
+    pcap_args.mode = arg_str0(NULL, NULL, "<mode>", "off|acl|promisc");
+    pcap_args.snaplen = arg_int0(NULL, NULL, "<bytes>", "snaplen value (64-1600)");
+    pcap_args.end = arg_end(3);
+
+    const esp_console_cmd_t cmd = {
+        .command = "pcap",
+        .help = "Control PCAP packet capture (TCP port 19000)",
+        .hint = NULL,
+        .func = &pcap,
+        .argtable = &pcap_args
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_led_gpio' command */
+static int set_led_gpio_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: set_led_gpio <gpio_number|none>\n");
+        printf("  gpio_number: GPIO pin number (0-48)\n");
+        printf("  none: disable LED status blinking\n");
+        printf("\nCurrent setting: ");
+        if (led_gpio < 0) {
+            printf("none (disabled)\n");
+        } else {
+            printf("GPIO %d\n", led_gpio);
+        }
+        return 0;
+    }
+
+    esp_err_t err;
+    int gpio_num;
+
+    // Parse argument
+    if (strcasecmp(argv[1], "none") == 0 || strcmp(argv[1], "-1") == 0) {
+        gpio_num = -1;
+    } else {
+        char *endptr;
+        gpio_num = strtol(argv[1], &endptr, 10);
+        if (*endptr != '\0' || gpio_num < 0 || gpio_num > 48) {
+            printf("Invalid GPIO number. Use 0-48 or 'none'.\n");
+            return 1;
+        }
+    }
+
+    err = set_config_param_int("led_gpio", gpio_num);
+    if (err == ESP_OK) {
+        if (gpio_num < 0) {
+            ESP_LOGI(TAG, "LED GPIO disabled.");
+            printf("LED status blinking disabled.\n");
+        } else {
+            ESP_LOGI(TAG, "LED GPIO set to %d.", gpio_num);
+            printf("LED status blinking set to GPIO %d.\n", gpio_num);
+        }
+        printf("Restart the device for changes to take effect.\n");
+    } else {
+        printf("Failed to save setting\n");
+    }
+    return err;
+}
+
+static void register_set_led_gpio(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_led_gpio",
+        .help = "Set GPIO for status LED blinking (use 'none' to disable)",
+        .hint = NULL,
+        .func = &set_led_gpio_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_led_lowactive' command - set LED low-active (inverted) mode */
+static int set_led_lowactive_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: set_led_lowactive <true|false>\n");
+        printf("  true: LED is active-low (inverted, common for onboard LEDs)\n");
+        printf("  false: LED is active-high (default)\n");
+        printf("\nCurrent setting: %s\n", led_lowactive ? "true (low-active)" : "false (active-high)");
+        return 0;
+    }
+
+    esp_err_t err;
+    int value;
+
+    // Parse boolean argument
+    if (parse_bool_true(argv[1])) {
+        value = 1;
+    } else if (parse_bool_false(argv[1])) {
+        value = 0;
+    } else {
+        printf("Invalid value. Use true/false.\n");
+        return 1;
+    }
+
+    err = set_config_param_int("led_low", value);
+    if (err == ESP_OK) {
+        led_lowactive = value;
+        if (value) {
+            ESP_LOGI(TAG, "LED set to low-active (inverted) mode.");
+            printf("LED set to low-active (inverted) mode.\n");
+        } else {
+            ESP_LOGI(TAG, "LED set to active-high (normal) mode.");
+            printf("LED set to active-high (normal) mode.\n");
+        }
+        printf("Change takes effect immediately.\n");
+    } else {
+        printf("Failed to save setting\n");
+    }
+    return err;
+}
+
+static void register_set_led_lowactive(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_led_lowactive",
+        .help = "Set LED to low-active (inverted) mode for active-low LEDs",
+        .hint = NULL,
+        .func = &set_led_lowactive_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_led_strip' command - set GPIO for addressable LED strip (WS2812) */
+static int set_led_strip_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: set_led_strip <gpio_number|none>\n");
+        printf("  gpio_number: GPIO pin for WS2812 data line (0-48)\n");
+        printf("  none: disable addressable LED strip\n");
+        printf("\nCurrent setting: ");
+        if (led_strip_gpio < 0) {
+            printf("none (disabled)\n");
+        } else {
+            printf("GPIO %d\n", led_strip_gpio);
+        }
+        return 0;
+    }
+
+    int gpio_num;
+    if (strcasecmp(argv[1], "none") == 0 || strcmp(argv[1], "-1") == 0) {
+        gpio_num = -1;
+    } else {
+        char *endptr;
+        gpio_num = strtol(argv[1], &endptr, 10);
+        if (*endptr != '\0' || gpio_num < 0 || gpio_num > 48) {
+            printf("Invalid GPIO number. Use 0-48 or 'none'.\n");
+            return 1;
+        }
+    }
+
+    esp_err_t err = set_config_param_int("ls_gpio", gpio_num);
+    if (err == ESP_OK) {
+        if (gpio_num < 0) {
+            printf("LED strip disabled.\n");
+        } else {
+            printf("LED strip set to GPIO %d.\n", gpio_num);
+        }
+        printf("Restart the device for changes to take effect.\n");
+    } else {
+        printf("Failed to save setting\n");
+    }
+    return err;
+}
+
+static void register_set_led_strip(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_led_strip",
+        .help = "Set GPIO for addressable LED strip (WS2812/SK6812, 'none' to disable, requires restart)",
+        .hint = NULL,
+        .func = &set_led_strip_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_ttl' command - set TTL override for upstream packets */
+static int set_ttl_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: set_ttl <value>\n");
+        printf("  value: 0-255 (0 = disabled, no TTL change)\n");
+        printf("\nCurrent setting: %d", sta_ttl_override);
+        if (sta_ttl_override == 0) {
+            printf(" (disabled)\n");
+        } else {
+            printf("\n");
+        }
+        return 0;
+    }
+
+    esp_err_t err;
+
+    // Parse argument
+    char *endptr;
+    long ttl_val = strtol(argv[1], &endptr, 10);
+    if (*endptr != '\0' || ttl_val < 0 || ttl_val > 255) {
+        printf("Invalid TTL value. Use 0-255 (0 = disabled).\n");
+        return 1;
+    }
+
+    err = set_config_param_int("sta_ttl", (int32_t)ttl_val);
+    if (err == ESP_OK) {
+        sta_ttl_override = (uint8_t)ttl_val;
+        if (ttl_val == 0) {
+            ESP_LOGI(TAG, "TTL override disabled.");
+            printf("TTL override disabled (no change to packets).\n");
+        } else {
+            ESP_LOGI(TAG, "TTL override set to %ld.", ttl_val);
+            printf("TTL override set to %ld for upstream packets.\n", ttl_val);
+        }
+    } else {
+        printf("Failed to save setting\n");
+    }
+    return err;
+}
+
+static void register_set_ttl(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_ttl",
+        .help = "Set TTL override for upstream STA packets (0 = disabled)",
+        .hint = NULL,
+        .func = &set_ttl_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_watchdog' command - set reconnect watchdog timeout */
+static int set_watchdog_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: set_watchdog <seconds>\n");
+        printf("  seconds: 0-65535 (0 = disabled, default)\n");
+        printf("\nCurrent setting: %d s", reconnect_watchdog_s);
+        printf(reconnect_watchdog_s == 0 ? " (disabled)\n" : "\n");
+        return 0;
+    }
+
+    char *endptr;
+    long val = strtol(argv[1], &endptr, 10);
+    if (*endptr != '\0' || val < 0 || val > 65535) {
+        printf("Invalid value. Use 0-65535 (0 = disabled).\n");
+        return 1;
+    }
+
+    esp_err_t err = set_config_param_int("wd_s", (int32_t)val);
+    if (err == ESP_OK) {
+        reconnect_watchdog_s = (uint16_t)val;
+        if (val == 0) {
+            printf("Reconnect watchdog disabled.\n");
+        } else {
+            printf("Reconnect watchdog set to %ld s.\n", val);
+        }
+    } else {
+        printf("Failed to save setting\n");
+    }
+    return err;
+}
+
+static void register_set_watchdog(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_watchdog",
+        .help = "Set reconnect watchdog timeout in seconds (0 = disabled, default)",
+        .hint = NULL,
+        .func = &set_watchdog_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'client_stats' command - enable/disable per-client traffic statistics */
+static int client_stats_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Per-client stats: %s\n", client_stats_enabled ? "enabled" : "disabled");
+        printf("Usage: client_stats <enable|disable>\n");
+        return 0;
+    }
+
+    bool enable;
+    if (strcmp(argv[1], "enable") == 0) {
+        enable = true;
+    } else if (strcmp(argv[1], "disable") == 0) {
+        enable = false;
+    } else {
+        printf("Usage: client_stats <enable|disable>\n");
+        return 1;
+    }
+
+    esp_err_t err = set_config_param_int("cstats_en", enable ? 1 : 0);
+    if (err != ESP_OK) {
+        printf("Failed to save setting\n");
+        return 1;
+    }
+    client_stats_enabled = enable;
+    printf("Per-client stats %s.\n", enable ? "enabled" : "disabled");
+    return 0;
+}
+
+static void register_client_stats_cmd(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "client_stats",
+        .help = "Enable or disable per-client traffic statistics",
+        .hint = NULL,
+        .func = &client_stats_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_ap_nat' command - enable or disable NAT on the AP interface */
+static int set_ap_nat_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("NAT: %s\n", ap_nat_enabled ? "enabled" : "disabled (routed mode)");
+        printf("Usage: set_ap_nat <on|off>  (requires restart)\n");
+        return 0;
+    }
+    const char *mode = argv[1];
+    int val;
+    if (strcasecmp(mode, "on") == 0 || strcmp(mode, "1") == 0) {
+        val = 1;
+    } else if (strcasecmp(mode, "off") == 0 || strcmp(mode, "0") == 0) {
+        val = 0;
+    } else {
+        printf("Usage: set_ap_nat <on|off>\n");
+        return 1;
+    }
+    set_config_param_int("ap_nat", val);
+    ap_nat_enabled = (uint8_t)val;
+    printf("AP NAT %s. Restart to apply.\n", val ? "enabled" : "disabled (routed mode)");
+    return 0;
+}
+
+static void register_set_ap_nat(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_ap_nat",
+        .help = "Enable or disable NAT on the AP interface (default: on). Requires restart.",
+        .hint = NULL,
+        .func = &set_ap_nat_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_tx_power' command - set WiFi TX power */
+static int set_tx_power_cmd(int argc, char **argv)
+{
+    int8_t current_power = 0;
+    esp_err_t ret = esp_wifi_get_max_tx_power(&current_power);
+
+    if (argc < 2) {
+        printf("Usage: set_tx_power <dBm>\n");
+        printf("  dBm: 2-20 (0 = max/default)\n");
+        printf("  Actual steps: 2, 5, 7, 8, 11, 13, 14, 15, 16, 18, 20\n");
+        if (ret == ESP_OK) {
+            printf("\nCurrent TX power: %.1f dBm (raw: %d)\n", current_power * 0.25, current_power);
+        }
+        int saved = 0;
+        get_config_param_int("tx_power", &saved);
+        if (saved > 0) {
+            printf("Saved setting: %d dBm\n", saved);
+        } else {
+            printf("Saved setting: max (default)\n");
+        }
+        return 0;
+    }
+
+    char *endptr;
+    long dbm = strtol(argv[1], &endptr, 10);
+    if (*endptr != '\0' || (dbm != 0 && (dbm < 2 || dbm > 20))) {
+        printf("Invalid value. Use 2-20 dBm (0 = max/default).\n");
+        return 1;
+    }
+
+    esp_err_t err = set_config_param_int("tx_power", (int32_t)dbm);
+
+    if (err != ESP_OK) {
+        printf("Failed to save setting\n");
+        return err;
+    }
+
+    if (dbm == 0) {
+        printf("TX power set to max (default). Restart to apply.\n");
+    } else {
+        int8_t power_qdbm = (int8_t)(dbm * 4);
+        ret = esp_wifi_set_max_tx_power(power_qdbm);
+        if (ret == ESP_OK) {
+            esp_wifi_get_max_tx_power(&current_power);
+            printf("TX power set to %.1f dBm (applied immediately, saved for reboot).\n", current_power * 0.25);
+        } else {
+            printf("Saved for next reboot. Could not apply now: %s\n", esp_err_to_name(ret));
+        }
+    }
+    return 0;
+}
+
+static void register_set_tx_power(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_tx_power",
+        .help = "Set WiFi TX power in dBm (2-20, 0 = max/default)",
+        .hint = NULL,
+        .func = &set_tx_power_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_wifi_country' command - set WiFi regulatory country code */
+static int set_wifi_country_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Current country code: %s\n", wifi_country_code);
+        printf("Usage: set_wifi_country <CC>\n");
+        printf("  CC: 2-char ISO 3166 code (e.g. US, DE, GB) or 01 for world-safe\n");
+        printf("  Default: 01 (world-safe, all standard channels allowed)\n");
+        return 0;
+    }
+
+    const char *cc = argv[1];
+    if (strlen(cc) != 2) {
+        printf("Country code must be exactly 2 characters (e.g. US, DE, 01).\n");
+        return 1;
+    }
+
+    char upper[3];
+    upper[0] = toupper((unsigned char)cc[0]);
+    upper[1] = toupper((unsigned char)cc[1]);
+    upper[2] = '\0';
+
+    esp_err_t err = set_config_param_str("wifi_cc", upper);
+    if (err != ESP_OK) {
+        printf("Failed to save country code: %s\n", esp_err_to_name(err));
+        return err;
+    }
+
+    wifi_country_code[0] = upper[0];
+    wifi_country_code[1] = upper[1];
+    wifi_country_code[2] = '\0';
+
+    esp_err_t ret = esp_wifi_set_country_code(wifi_country_code, true);
+    if (ret == ESP_OK) {
+        printf("Country code set to %s (applied immediately, saved for reboot).\n", wifi_country_code);
+    } else {
+        printf("Country code %s saved. Could not apply now: %s\n", wifi_country_code, esp_err_to_name(ret));
+    }
+
+    return 0;
+}
+
+static void register_set_wifi_country(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_wifi_country",
+        .help = "Set WiFi regulatory country code (2-char ISO 3166, e.g. US, DE; or 01 for world-safe)",
+        .hint = NULL,
+        .func = &set_wifi_country_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_antenna' command - GPIO-driven antenna (RF) switch */
+static void print_antenna_status(void)
+{
+    if (antenna_gpio < 0) {
+        printf("Antenna switch: disabled (no control GPIO configured)\n");
+        return;
+    }
+    printf("Antenna switch: GPIO%d = %d (%s antenna)\n",
+           antenna_gpio, antenna_state, antenna_state ? "external" : "on-board");
+    if (antenna_en_gpio >= 0) {
+        printf("  Enable GPIO: %d (held low)\n", antenna_en_gpio);
+    } else {
+        printf("  Enable GPIO: none\n");
+    }
+}
+
+/* Parse a plain decimal GPIO number; returns false on trailing junk */
+static bool parse_gpio_arg(const char *s, int *out)
+{
+    char *end;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < -1 || v >= GPIO_NUM_MAX) {
+        return false;
+    }
+    *out = (int)v;
+    return true;
+}
+
+static int set_antenna_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        print_antenna_status();
+        printf("Usage: set_antenna [<gpio>] <0|1> [<enable_gpio>]\n");
+        printf("       set_antenna off            disable, release the pins\n");
+        printf("  0 = on-board antenna, 1 = external antenna\n");
+        printf("  <enable_gpio> is optional and held low while the switch is used\n");
+        printf("  %s\n", ANTENNA_BOARD_HINT);
+        return 0;
+    }
+
+    int gpio, state = 0, en_gpio = -1;
+
+    if (strcasecmp(argv[1], "off") == 0 || strcmp(argv[1], "-1") == 0) {
+        gpio = -1;
+    } else if (argc == 2) {
+        /* Selection only — reuse the pins already configured */
+        if (antenna_gpio < 0) {
+            printf("No control GPIO configured yet.\n");
+            printf("Usage: set_antenna <gpio> <0|1> [<enable_gpio>]\n");
+            printf("  %s\n", ANTENNA_BOARD_HINT);
+            return 1;
+        }
+        if (strcmp(argv[1], "0") != 0 && strcmp(argv[1], "1") != 0) {
+            printf("Invalid value. Use 0 (on-board) or 1 (external).\n");
+            return 1;
+        }
+        gpio = antenna_gpio;
+        en_gpio = antenna_en_gpio;
+        state = (argv[1][0] == '1');
+    } else {
+        if (!parse_gpio_arg(argv[1], &gpio) || gpio < 0) {
+            printf("Invalid control GPIO '%s'.\n", argv[1]);
+            return 1;
+        }
+        if (strcmp(argv[2], "0") != 0 && strcmp(argv[2], "1") != 0) {
+            printf("Invalid value. Use 0 (on-board) or 1 (external).\n");
+            return 1;
+        }
+        state = (argv[2][0] == '1');
+        if (argc > 3) {
+            if (strcasecmp(argv[3], "none") == 0) {
+                en_gpio = -1;
+            } else if (!parse_gpio_arg(argv[3], &en_gpio)) {
+                printf("Invalid enable GPIO '%s'.\n", argv[3]);
+                return 1;
+            }
+        }
+    }
+
+    esp_err_t err = antenna_switch_set(gpio, state, en_gpio);
+    if (err == ESP_ERR_INVALID_ARG) {
+        printf("GPIO not usable as an output on this target.\n");
+        return 1;
+    }
+    if (err != ESP_OK) {
+        printf("Failed to save setting: %s\n", esp_err_to_name(err));
+        return err;
+    }
+
+    if (gpio < 0) {
+        printf("Antenna switch disabled.\n");
+    } else {
+        printf("Switched to %s antenna (GPIO%d = %d).\n",
+               state ? "external" : "on-board", gpio, state);
+    }
+    printf("Setting saved (persists across reboots).\n");
+    return 0;
+}
+
+static void register_set_antenna(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_antenna",
+        .help = "Antenna switch: set_antenna [<gpio>] <0=on-board|1=external> [<enable_gpio>], or 'off'",
+        .hint = NULL,
+        .func = &set_antenna_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+#if defined(CONFIG_IDF_TARGET_ESP32C6)
+/* 'set_rf_switch_XIAO' command - XIAO ESP32-C6 antenna selection.
+ * Kept for compatibility; a thin wrapper over the generic antenna switch
+ * with the XIAO's pins (GPIO14 selects, GPIO3 enables). */
+static int set_rf_switch_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        print_antenna_status();
+        printf("Usage: set_rf_switch_XIAO <0|1>\n");
+        printf("  0 = built-in ceramic antenna (default)\n");
+        printf("  1 = external antenna\n");
+        return 0;
+    }
+
+    int value;
+    if (strcmp(argv[1], "1") == 0) {
+        value = 1;
+    } else if (strcmp(argv[1], "0") == 0) {
+        value = 0;
+    } else {
+        printf("Invalid value. Use 0 (built-in) or 1 (external).\n");
+        return 1;
+    }
+
+    esp_err_t err = antenna_switch_set(14, value, 3);
+    if (err == ESP_OK) {
+        /* Keep the legacy key in step for configs exported from older builds */
+        set_config_param_int("rf_switch", value);
+        if (value) {
+            printf("Switched to external antenna.\n");
+        } else {
+            printf("Switched to built-in ceramic antenna.\n");
+        }
+        printf("Setting saved (persists across reboots).\n");
+    } else {
+        printf("Failed to save setting\n");
+    }
+    return err;
+}
+
+static void register_set_rf_switch(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_rf_switch_XIAO",
+        .help = "XIAO ESP32-C6: switch between built-in (0) and external (1) antenna",
+        .hint = NULL,
+        .func = &set_rf_switch_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+#endif
+
+/* 'set_ap_hidden' command - hide or show AP SSID */
+static int set_ap_hidden_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("AP SSID hidden: %s\n", ap_ssid_hidden ? "yes" : "no");
+        return 0;
+    }
+
+    esp_err_t err;
+    int hidden_val;
+
+    // Parse argument
+    if (parse_bool_true(argv[1])) {
+        hidden_val = 1;
+    } else if (parse_bool_false(argv[1])) {
+        hidden_val = 0;
+    } else {
+        printf("Invalid value. Use true/false.\n");
+        return 1;
+    }
+
+    err = set_config_param_int("ap_hidden", hidden_val);
+    if (err == ESP_OK) {
+        ap_ssid_hidden = (uint8_t)hidden_val;
+        ESP_LOGI(TAG, "AP SSID hidden set to: %s", hidden_val ? "yes" : "no");
+        printf("AP SSID hidden set to: %s\n", hidden_val ? "yes" : "no");
+        printf("Restart the device for changes to take effect.\n");
+    } else {
+        printf("Failed to save setting\n");
+    }
+    return err;
+}
+
+static void register_set_ap_hidden(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_ap_hidden",
+        .help = "Hide or show the AP SSID (on/off, requires restart)",
+        .hint = NULL,
+        .func = &set_ap_hidden_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_ap_known_only' command - allow only clients with a fixed-IP reservation */
+static int set_ap_known_only_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("AP known clients only: %s\n", ap_known_only ? "on" : "off");
+        return 0;
+    }
+
+    esp_err_t err;
+    int known_val;
+
+    if (parse_bool_true(argv[1])) {
+        known_val = 1;
+    } else if (parse_bool_false(argv[1])) {
+        known_val = 0;
+    } else {
+        printf("Invalid value. Use on/off.\n");
+        return 1;
+    }
+
+    err = set_config_param_int("ap_known_only", known_val);
+    if (err == ESP_OK) {
+        ap_known_only = (uint8_t)known_val;
+        ESP_LOGI(TAG, "AP known clients only set to: %s", known_val ? "on" : "off");
+        printf("AP known clients only set to: %s\n", known_val ? "on" : "off");
+        if (known_val) {
+            printf("Applies to new connections; only clients with a fixed-IP DHCP reservation can connect.\n");
+        }
+    } else {
+        printf("Failed to save setting\n");
+    }
+    return err;
+}
+
+static void register_set_ap_known_only(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_ap_known_only",
+        .help = "Allow only clients with a fixed-IP DHCP reservation to join the AP (on/off)",
+        .hint = NULL,
+        .func = &set_ap_known_only_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_ap_auth' command - set AP authentication mode */
+static int set_ap_auth_cmd(int argc, char **argv)
+{
+    const char *modes[] = {"wpa2wpa3", "wpa2", "wpa3"};
+
+    if (argc < 2) {
+        printf("AP auth mode: %s\n", modes[ap_authmode <= 2 ? ap_authmode : 0]);
+        return 0;
+    }
+
+    int mode_val = -1;
+    if (strcasecmp(argv[1], "wpa2wpa3") == 0 || strcasecmp(argv[1], "wpa2/wpa3") == 0) {
+        mode_val = 0;
+    } else if (strcasecmp(argv[1], "wpa2") == 0) {
+        mode_val = 1;
+    } else if (strcasecmp(argv[1], "wpa3") == 0) {
+        mode_val = 2;
+    } else {
+        printf("Invalid mode. Use: wpa2, wpa3, or wpa2wpa3\n");
+        return 1;
+    }
+
+    esp_err_t err = set_config_param_int("ap_authmode", mode_val);
+    if (err == ESP_OK) {
+        ap_authmode = (uint8_t)mode_val;
+        printf("AP auth mode set to: %s\n", modes[mode_val]);
+        printf("Restart the device for changes to take effect.\n");
+    } else {
+        printf("Failed to save setting\n");
+    }
+    return err;
+}
+
+static void register_set_ap_auth(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_ap_auth",
+        .help = "Set AP auth mode (wpa2, wpa3, or wpa2wpa3; requires restart)",
+        .hint = NULL,
+        .func = &set_ap_auth_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+#if CONFIG_ETH_UPLINK
+/* 'set_ap_channel' command - set AP WiFi channel (ETH_UPLINK only) */
+static int set_ap_channel_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        if (ap_channel == 0) {
+            printf("AP channel: auto\n");
+        } else {
+            printf("AP channel: %d\n", ap_channel);
+        }
+        return 0;
+    }
+
+    int channel_val = atoi(argv[1]);
+    if (channel_val < 0 || channel_val > 13) {
+        printf("Invalid channel. Use 0 (auto) or 1-13.\n");
+        return 1;
+    }
+
+    esp_err_t err = set_config_param_int("ap_channel", channel_val);
+    if (err == ESP_OK) {
+        ap_channel = (uint8_t)channel_val;
+        if (channel_val == 0) {
+            printf("AP channel set to: auto\n");
+        } else {
+            printf("AP channel set to: %d\n", channel_val);
+        }
+        printf("Restart the device for changes to take effect.\n");
+    } else {
+        printf("Failed to save setting\n");
+    }
+    return err;
+}
+
+static void register_set_ap_channel(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_ap_channel",
+        .help = "Set AP WiFi channel (0=auto, 1-13=fixed, requires restart)",
+        .hint = NULL,
+        .func = &set_ap_channel_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+#endif
+
+/* 'ap' command - enable/disable AP interface dynamically */
+static int ap_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        wifi_mode_t mode = WIFI_MODE_NULL;
+        esp_wifi_get_mode(&mode);
+#if CONFIG_ETH_UPLINK
+        bool running = (mode == WIFI_MODE_AP);
+#else
+        bool running = (mode == WIFI_MODE_APSTA || mode == WIFI_MODE_AP);
+#endif
+        printf("AP interface: %s\n", running ? "enabled" : "disabled");
+        printf("  (NVS setting: %s)\n", ap_disabled ? "disabled" : "enabled");
+        printf("\nUsage:\n");
+        printf("  ap enable   - Enable AP interface immediately\n");
+        printf("  ap disable  - Disable AP interface immediately\n");
+        return 0;
+    }
+
+    const char *action = argv[1];
+    if (strcmp(action, "enable") == 0) {
+        if (!ap_disabled) {
+            printf("AP interface is already enabled.\n");
+            return 0;
+        }
+        ap_set_enabled(true);
+        printf("AP interface enabled.\n");
+    } else if (strcmp(action, "disable") == 0) {
+        if (ap_disabled) {
+            printf("AP interface is already disabled.\n");
+            return 0;
+        }
+        ap_set_enabled(false);
+        printf("AP interface disabled.\n");
+    } else {
+        printf("Unknown action: %s\n", action);
+        printf("Usage: ap <enable|disable>\n");
+        return 1;
+    }
+    return 0;
+}
+
+static void register_ap(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "ap",
+        .help = "Enable or disable the AP interface\n"
+                "  ap          - Show current AP status\n"
+                "  ap enable   - Enable AP interface\n"
+                "  ap disable  - Disable AP interface",
+        .hint = " <enable|disable>",
+        .func = &ap_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+#if WIFI_HAS_5GHZ
+/* 'set_sta_band' command - set STA band preference (5 GHz capable targets) */
+static int set_sta_band_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        const char *names[] = {"auto", "2.4 GHz", "5 GHz"};
+        printf("STA band preference: %s\n", names[sta_band <= STA_BAND_5G ? sta_band : 0]);
+        return 0;
+    }
+
+    int band_val;
+    if (strcmp(argv[1], "auto") == 0 || strcmp(argv[1], "0") == 0) {
+        band_val = STA_BAND_AUTO;
+    } else if (strcmp(argv[1], "2.4") == 0 || strcmp(argv[1], "1") == 0) {
+        band_val = STA_BAND_2G;
+    } else if (strcmp(argv[1], "5") == 0 || strcmp(argv[1], "2") == 0) {
+        band_val = STA_BAND_5G;
+    } else {
+        printf("Invalid band. Use: auto, 2.4, or 5\n");
+        return 1;
+    }
+
+    esp_err_t err = set_config_param_int("sta_band", band_val);
+    if (err == ESP_OK) {
+        sta_band = (uint8_t)band_val;
+        const char *names[] = {"auto", "2.4 GHz", "5 GHz"};
+        printf("STA band preference set to: %s\n", names[band_val]);
+        printf("Restart the device for changes to take effect.\n");
+    } else {
+        printf("Failed to save setting\n");
+    }
+    return err;
+}
+
+static void register_set_sta_band(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_sta_band",
+        .help = "Set STA band preference (auto, 2.4, 5; requires restart)",
+        .hint = NULL,
+        .func = &set_sta_band_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+#endif /* WIFI_HAS_5GHZ */
+
+/**
+ * @brief Format IP address with device name for /32 addresses
+ * If the IP has a full /32 mask and a matching DHCP reservation with a name,
+ * returns the device name. Otherwise returns the formatted IP/mask.
+ */
+static char* acl_format_ip_with_name(uint32_t ip, uint32_t mask, char* buf, size_t buf_len)
+{
+    /* Check for "any" (0.0.0.0/0) */
+    if (ip == 0 && mask == 0) {
+        snprintf(buf, buf_len, "any");
+        return buf;
+    }
+
+    /* For /32 addresses, try to look up device name */
+    if (mask == 0xFFFFFFFF) {
+        const char* name = lookup_device_name_by_ip(ip);
+        if (name != NULL) {
+            snprintf(buf, buf_len, "%s", name);
+            return buf;
+        }
+    }
+
+    /* Fall back to standard IP formatting */
+    return acl_format_ip(ip, mask, buf, buf_len);
+}
+
+/**
+ * @brief Parse IP address or device name for ACL rules
+ * First tries to parse as IP/CIDR, then tries to resolve as device name.
+ * Device names are resolved to /32 addresses.
+ */
+static bool acl_parse_ip_or_name(const char* str, uint32_t* ip, uint32_t* mask)
+{
+    /* First try standard IP parsing */
+    if (acl_parse_ip(str, ip, mask)) {
+        return true;
+    }
+
+    /* Try to resolve as device name (case-insensitive) */
+    if (resolve_device_name_to_ip(str, ip)) {
+        *mask = 0xFFFFFFFF;  /* /32 for device names */
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * @brief Print ACL rules with device names for /32 addresses
+ */
+static void acl_print_with_names(uint8_t acl_no)
+{
+    if (acl_no >= MAX_ACL_LISTS) {
+        printf("Invalid ACL list number\n");
+        return;
+    }
+
+    printf("\nACL: %s\n", acl_get_name(acl_no));
+    printf("==========\n");
+
+    acl_stats_t *stats = acl_get_stats(acl_no);
+    printf("Stats: allowed=%lu, denied=%lu, no_match=%lu\n",
+           (unsigned long)stats->packets_allowed,
+           (unsigned long)stats->packets_denied,
+           (unsigned long)stats->packets_nomatch);
+
+    if (acl_is_empty(acl_no)) {
+        printf("No rules configured (all packets allowed)\n");
+        return;
+    }
+
+    printf("\n%3s  %-6s  %-20s  %-20s  %-6s  %-6s  %-8s  %s\n",
+           "Idx", "Proto", "Source", "Destination", "SPort", "DPort", "Action", "Hits");
+    printf("---  ------  --------------------  --------------------  ------  ------  --------  ----\n");
+
+    /* Snapshot rules under the lock, then print outside to avoid
+     * blocking packet processing (printf can block via remote console). */
+    acl_entry_t rules_copy[MAX_ACL_ENTRIES];
+    acl_lock();
+    acl_entry_t *rules = acl_get_rules(acl_no);
+    memcpy(rules_copy, rules, sizeof(rules_copy));
+    acl_unlock();
+
+    for (int i = 0; i < MAX_ACL_ENTRIES; i++) {
+        acl_entry_t *rule = &rules_copy[i];
+        if (!rule->valid) {
+            continue;
+        }
+
+        /* Format protocol */
+        const char *proto_str;
+        switch (rule->proto) {
+            case 0:  proto_str = "IP"; break;
+            case 1:  proto_str = "ICMP"; break;
+            case 6:  proto_str = "TCP"; break;
+            case 17: proto_str = "UDP"; break;
+            default: proto_str = "?"; break;
+        }
+
+        /* Format IP addresses with device names */
+        char src_str[24], dest_str[24];
+        acl_format_ip_with_name(rule->src, rule->s_mask, src_str, sizeof(src_str));
+        acl_format_ip_with_name(rule->dest, rule->d_mask, dest_str, sizeof(dest_str));
+
+        /* Format ports */
+        char s_port_str[8], d_port_str[8];
+        if (rule->s_port == 0) {
+            strcpy(s_port_str, "*");
+        } else {
+            snprintf(s_port_str, sizeof(s_port_str), "%d", rule->s_port);
+        }
+        if (rule->d_port == 0) {
+            strcpy(d_port_str, "*");
+        } else {
+            snprintf(d_port_str, sizeof(d_port_str), "%d", rule->d_port);
+        }
+
+        /* Format action */
+        const char *action_str;
+        uint8_t action = rule->allow & 0x01;
+        uint8_t monitor = rule->allow & ACL_MONITOR;
+        if (action == ACL_ALLOW) {
+            action_str = monitor ? "allow+M" : "allow";
+        } else {
+            action_str = monitor ? "deny+M" : "deny";
+        }
+
+        printf("%3d  %-6s  %-20s  %-20s  %-6s  %-6s  %-8s  %lu\n",
+               i, proto_str, src_str, dest_str, s_port_str, d_port_str,
+               action_str, (unsigned long)rule->hit_count);
+    }
+}
+
+/* 'acl' command implementation */
+static int acl_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: acl <list> <action> [params...]\n");
+        printf("Lists: from_esp, to_esp, from_ap, to_ap\n");
+        printf("\nActions:\n");
+        printf("  acl <list> clear              - Clear all rules from list\n");
+        printf("  acl <list> clear_stats        - Clear statistics for list\n");
+        printf("  acl <list> del <idx>          - Delete rule at index\n");
+        printf("  acl <list> <proto> <src> [<s_port>] <dst> [<d_port>] <action>\n");
+        printf("\nProtocols: IP, TCP, UDP, ICMP\n");
+        printf("Addresses: IP/mask, 'any', or device name from DHCP reservations\n");
+        printf("Ports:     Port number or '*' for any (TCP/UDP only)\n");
+        printf("Actions:   allow, deny, allow_monitor, deny_monitor\n");
+        printf("\nExamples:\n");
+        printf("  acl from_esp clear\n");
+        printf("  acl from_esp IP any 255.255.255.255 allow\n");
+        printf("  acl from_esp UDP any any any 53 allow\n");
+        printf("  acl from_esp TCP any 22 192.168.4.0/24 * deny\n");
+        printf("  acl from_esp IP any MyPhone deny      # Use device name\n");
+        printf("  acl from_esp IP any any deny          # Block all at end\n");
+        printf("  acl from_esp del 0                    # Delete first rule\n");
+        return 0;
+    }
+
+    /* Parse list name */
+    int list_no = acl_parse_name(argv[1]);
+    if (list_no < 0) {
+        printf("Invalid ACL list: %s\n", argv[1]);
+        printf("Use: from_esp, to_esp, from_ap, to_ap\n");
+        return 1;
+    }
+
+    if (argc < 3) {
+        printf("Missing action. Use: clear, clear_stats, del, or <proto> <src> <dst> <action>\n");
+        return 1;
+    }
+
+    /* Handle 'clear' action */
+    if (strcmp(argv[2], "clear") == 0) {
+        acl_clear(list_no);
+        save_acl_rules();
+        ESP_LOGW(TAG, "ACL list %s cleared via CLI.", acl_get_name(list_no));
+        printf("ACL list %s cleared.\n", acl_get_name(list_no));
+        return 0;
+    }
+
+    /* Handle 'clear_stats' action */
+    if (strcmp(argv[2], "clear_stats") == 0) {
+        acl_clear_stats(list_no);
+        printf("ACL statistics for %s cleared.\n", acl_get_name(list_no));
+        return 0;
+    }
+
+    /* Handle 'del' action */
+    if (strcmp(argv[2], "del") == 0) {
+        if (argc < 4) {
+            printf("Usage: acl <list> del <index>\n");
+            return 1;
+        }
+        int idx = atoi(argv[3]);
+        if (idx < 0 || idx >= MAX_ACL_ENTRIES) {
+            printf("Invalid rule index: %d (0-%d)\n", idx, MAX_ACL_ENTRIES - 1);
+            return 1;
+        }
+        if (acl_delete(list_no, idx)) {
+            save_acl_rules();
+            ESP_LOGW(TAG, "ACL rule %d deleted from %s via CLI.", idx, acl_get_name(list_no));
+            printf("Deleted rule %d from %s\n", idx, acl_get_name(list_no));
+        } else {
+            printf("No rule at index %d\n", idx);
+        }
+        return 0;
+    }
+
+    /* Parse as add rule: <proto> <src> [<s_port>] <dst> [<d_port>] <action> */
+    const char *proto_str = argv[2];
+    uint8_t proto;
+
+    if (strcasecmp(proto_str, "IP") == 0) {
+        proto = 0;
+    } else if (strcasecmp(proto_str, "ICMP") == 0) {
+        proto = 1;
+    } else if (strcasecmp(proto_str, "TCP") == 0) {
+        proto = 6;
+    } else if (strcasecmp(proto_str, "UDP") == 0) {
+        proto = 17;
+    } else {
+        printf("Invalid protocol: %s (use IP, ICMP, TCP, UDP)\n", proto_str);
+        return 1;
+    }
+
+    /* For TCP/UDP, we expect: proto src s_port dst d_port action (7 args total)
+       For IP/ICMP, we expect: proto src dst action (5 args total)
+       But we also support: proto src dst action (no ports) for TCP/UDP */
+
+    uint32_t src_ip, src_mask, dst_ip, dst_mask;
+    uint16_t s_port = 0, d_port = 0;
+    uint8_t allow;
+    int arg_idx = 3;
+
+    /* Parse source (IP/CIDR, 'any', or device name) */
+    if (arg_idx >= argc) {
+        printf("Missing source address\n");
+        return 1;
+    }
+    if (!acl_parse_ip_or_name(argv[arg_idx], &src_ip, &src_mask)) {
+        printf("Invalid source address or device name: %s\n", argv[arg_idx]);
+        return 1;
+    }
+    arg_idx++;
+
+    /* For TCP/UDP, check if next arg is a port */
+    if ((proto == 6 || proto == 17) && arg_idx < argc) {
+        if (strcmp(argv[arg_idx], "*") == 0 || strcmp(argv[arg_idx], "any") == 0) {
+            s_port = 0;
+            arg_idx++;
+        } else if (argv[arg_idx][0] >= '0' && argv[arg_idx][0] <= '9') {
+            s_port = atoi(argv[arg_idx]);
+            arg_idx++;
+        }
+        /* If not a port-like value, treat as destination */
+    }
+
+    /* Parse destination (IP/CIDR, 'any', or device name) */
+    if (arg_idx >= argc) {
+        printf("Missing destination address\n");
+        return 1;
+    }
+    if (!acl_parse_ip_or_name(argv[arg_idx], &dst_ip, &dst_mask)) {
+        printf("Invalid destination address or device name: %s\n", argv[arg_idx]);
+        return 1;
+    }
+    arg_idx++;
+
+    /* For TCP/UDP, check if next arg is a port */
+    if ((proto == 6 || proto == 17) && arg_idx < argc) {
+        if (strcmp(argv[arg_idx], "*") == 0 || strcmp(argv[arg_idx], "any") == 0) {
+            d_port = 0;
+            arg_idx++;
+        } else if (argv[arg_idx][0] >= '0' && argv[arg_idx][0] <= '9') {
+            d_port = atoi(argv[arg_idx]);
+            arg_idx++;
+        }
+        /* If not a port-like value, treat as action */
+    }
+
+    /* Parse action */
+    if (arg_idx >= argc) {
+        printf("Missing action (allow, deny, allow_monitor, deny_monitor)\n");
+        return 1;
+    }
+    const char *action_str = argv[arg_idx];
+
+    if (strcasecmp(action_str, "allow") == 0) {
+        allow = ACL_ALLOW;
+    } else if (strcasecmp(action_str, "deny") == 0) {
+        allow = ACL_DENY;
+    } else if (strcasecmp(action_str, "allow_monitor") == 0) {
+        allow = ACL_ALLOW | ACL_MONITOR;
+    } else if (strcasecmp(action_str, "deny_monitor") == 0) {
+        allow = ACL_DENY | ACL_MONITOR;
+    } else {
+        printf("Invalid action: %s (use allow, deny, allow_monitor, deny_monitor)\n", action_str);
+        return 1;
+    }
+
+    /* Add the rule */
+    if (acl_add(list_no, src_ip, src_mask, dst_ip, dst_mask, proto, s_port, d_port, allow)) {
+        save_acl_rules();
+        ESP_LOGW(TAG, "ACL rule added to %s via CLI.", acl_get_name(list_no));
+        printf("Rule added to %s\n", acl_get_name(list_no));
+    } else {
+        printf("Failed to add rule (list may be full)\n");
+        return 1;
+    }
+
+    return 0;
+}
+
+static void register_acl(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "acl",
+        .help = "Manage firewall ACL rules\n"
+                "  acl <list> <proto> <src> [<s_port>] <dst> [<d_port>] <action>  - Add rule\n"
+                "  acl <list> del <index>       - Delete rule at index\n"
+                "  acl <list> clear             - Clear all rules from list\n"
+                "  acl <list> clear_stats       - Clear statistics for list\n"
+                "  Lists: to_esp, from_esp, to_ap, from_ap\n"
+                "  Protocols: IP, TCP, UDP, ICMP\n"
+                "  Actions: allow, deny, allow_monitor, deny_monitor",
+        .hint = " <list> <proto> <src> [<s_port>] <dst> [<d_port>] <action>",
+        .func = &acl_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'remote_console' command implementation */
+static int remote_console_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: remote_console <action> [args]\n");
+        printf("  status              - Show remote console status\n");
+        printf("  enable              - Enable remote console\n");
+        printf("  disable             - Disable remote console\n");
+        printf("  port <port>         - Set TCP port (requires restart)\n");
+        printf("  bind <both|ap|sta>  - Set interface binding\n");
+        printf("  timeout <seconds>   - Set idle timeout (0=none)\n");
+        printf("  kick                - Disconnect current session\n");
+        return 0;
+    }
+
+    const char *action = argv[1];
+
+    if (strcmp(action, "status") == 0) {
+        remote_console_config_t config;
+        remote_console_status_t status;
+        remote_console_get_config(&config);
+        remote_console_get_status(&status);
+
+        printf("Remote Console Status:\n");
+        printf("======================\n");
+        printf("Enabled:        %s\n", config.enabled ? "yes" : "no");
+        printf("Port:           %d\n", config.port);
+
+        { char _bs[20]; fmt_web_bind(config.bind, _bs); printf("Interface:      %s\n", _bs); }
+        printf("Idle timeout:   %lu sec\n", (unsigned long)config.idle_timeout_sec);
+
+        const char *state_str[] = {"disabled", "listening", "auth wait", "active"};
+        printf("State:          %s\n", state_str[status.state]);
+
+        if (status.state == RC_STATE_ACTIVE) {
+            printf("Client IP:      %s\n", status.client_ip);
+            printf("Session time:   %lu sec\n", (unsigned long)status.session_duration_sec);
+            printf("Idle:           %lu sec\n", (unsigned long)status.idle_sec);
+        }
+
+        printf("Connections:    %lu total\n", (unsigned long)status.total_connections);
+        printf("Auth failures:  %lu\n", (unsigned long)status.failed_auths);
+
+        printf("\nWARNING: Currently uses plain TCP (not encrypted).\n");
+
+    } else if (strcmp(action, "enable") == 0) {
+        esp_err_t err = remote_console_enable();
+        if (err == ESP_OK) {
+            ESP_LOGW(TAG, "Remote console enabled via CLI.");
+            printf("Remote console enabled.\n");
+        } else {
+            printf("Error: %s\n", esp_err_to_name(err));
+        }
+
+    } else if (strcmp(action, "disable") == 0) {
+        remote_console_disable();
+        ESP_LOGW(TAG, "Remote console disabled via CLI.");
+        printf("Remote console disabled.\n");
+
+    } else if (strcmp(action, "port") == 0) {
+        if (argc < 3) {
+            printf("Usage: remote_console port <port>\n");
+            return 1;
+        }
+        int port = atoi(argv[2]);
+        if (port < 1 || port > 65535) {
+            printf("Invalid port number (1-65535)\n");
+            return 1;
+        }
+        remote_console_set_port((uint16_t)port);
+        ESP_LOGW(TAG, "Remote console port changed to %d via CLI.", port);
+        printf("Port set to %d. Restart or disable/enable to apply.\n", port);
+
+    } else if (strcmp(action, "bind") == 0) {
+        if (argc < 3) {
+            printf("Usage: remote_console bind <ap,sta,vpn>\n");
+            printf("  Comma-separated list, e.g.: ap,sta or ap,vpn\n");
+            return 1;
+        }
+        uint8_t bind = 0;
+        char arg_copy[64];
+        strncpy(arg_copy, argv[2], sizeof(arg_copy) - 1);
+        arg_copy[sizeof(arg_copy) - 1] = '\0';
+        char *token = strtok(arg_copy, ",");
+        while (token) {
+            if ((strcmp(token, "ap") == 0)||(strcmp(token, "AP")) == 0) bind |= RC_BIND_AP;
+            else if ((strcmp(token, "sta") == 0)||(strcmp(token, "STA") == 0)) bind |= RC_BIND_STA;
+            else if ((strcmp(token, "vpn") == 0)||(strcmp(token, "VPN")== 0)) bind |= RC_BIND_VPN;
+            else {
+                printf("Unknown interface: %s. Use: ap, sta, vpn\n", token);
+                return 1;
+            }
+            token = strtok(NULL, ",");
+        }
+        if (bind == 0) {
+            printf("Must specify at least one interface\n");
+            return 1;
+        }
+        remote_console_set_bind(bind);
+        ESP_LOGW(TAG, "Remote console bind changed to %s via CLI.", argv[2]);
+        printf("Bind set. Restart or disable/enable to apply.\n");
+
+    } else if (strcmp(action, "timeout") == 0) {
+        if (argc < 3) {
+            printf("Usage: remote_console timeout <seconds>\n");
+            return 1;
+        }
+        uint32_t timeout = (uint32_t)atoi(argv[2]);
+        remote_console_set_timeout(timeout);
+        ESP_LOGI(TAG, "Remote console timeout changed to %lu sec via CLI.", (unsigned long)timeout);
+        printf("Timeout set to %lu seconds.\n", (unsigned long)timeout);
+
+    } else if (strcmp(action, "kick") == 0) {
+        esp_err_t err = remote_console_kick();
+        if (err == ESP_OK) {
+            ESP_LOGW(TAG, "Remote console session kicked via CLI.");
+            printf("Kick request sent.\n");
+        } else {
+            printf("No active session to kick.\n");
+        }
+
+    } else {
+        printf("Unknown action: %s\n", action);
+        return 1;
+    }
+
+    return 0;
+}
+
+static void register_remote_console_cmd(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "remote_console",
+        .help = "Manage remote console (network CLI access)\n"
+                "  remote_console status              - Show status and connection info\n"
+                "  remote_console enable               - Enable remote console\n"
+                "  remote_console disable              - Disable remote console\n"
+                "  remote_console port <port>          - Set TCP port (default: 2323)\n"
+                "  remote_console bind <ap,sta,vpn>    - Set interface binding\n"
+                "  remote_console timeout <seconds>    - Set idle timeout (0=none)\n"
+                "  remote_console kick                 - Disconnect current session",
+        .hint = " <action> [<args>]",
+        .func = &remote_console_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'syslog' command - configure remote syslog forwarding */
+static int syslog_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: syslog <action> [args]\n");
+        printf("  status                    - Show syslog configuration\n");
+        printf("  enable <server> [<port>]  - Enable syslog (default port 514)\n");
+        printf("  disable                   - Disable syslog forwarding\n");
+        return 0;
+    }
+
+    const char *action = argv[1];
+
+    if (strcmp(action, "status") == 0) {
+        bool enabled;
+        char server[SYSLOG_MAX_SERVER_LEN];
+        uint16_t port;
+        syslog_get_config(&enabled, server, sizeof(server), &port);
+
+        printf("Syslog Status:\n");
+        printf("==============\n");
+        printf("Enabled:  %s\n", enabled ? "yes" : "no");
+        printf("Server:   %s\n", server[0] ? server : "(not set)");
+        printf("Port:     %u\n", port);
+
+    } else if (strcmp(action, "enable") == 0) {
+        if (argc < 3) {
+            printf("Usage: syslog enable <server> [<port>]\n");
+            return 1;
+        }
+        const char *server = argv[2];
+        uint16_t port = SYSLOG_DEFAULT_PORT;
+        if (argc >= 4) {
+            int p = atoi(argv[3]);
+            if (p < 1 || p > 65535) {
+                printf("Invalid port number (1-65535)\n");
+                return 1;
+            }
+            port = (uint16_t)p;
+        }
+        esp_err_t err = syslog_enable(server, port);
+        if (err == ESP_OK) {
+            ESP_LOGW(TAG, "Syslog enabled: %s:%u via CLI.", server, port);
+            printf("Syslog enabled: %s:%u\n", server, port);
+        } else {
+            printf("Error: %s\n", esp_err_to_name(err));
+        }
+
+    } else if (strcmp(action, "disable") == 0) {
+        syslog_disable();
+        ESP_LOGW(TAG, "Syslog disabled via CLI.");
+        printf("Syslog disabled.\n");
+
+    } else {
+        printf("Unknown action: %s\n", action);
+        return 1;
+    }
+
+    return 0;
+}
+
+static void register_syslog_cmd(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "syslog",
+        .help = "Manage remote syslog forwarding\n"
+                "  syslog status                    - Show syslog configuration\n"
+                "  syslog enable <server> [<port>]  - Enable syslog (default port 514)\n"
+                "  syslog disable                   - Disable syslog forwarding",
+        .hint = " <action> [<args>]",
+        .func = &syslog_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_tz' command - set timezone */
+static int set_tz_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        const char *tz = getenv("TZ");
+        printf("Timezone: %s\n", tz ? tz : "(not set, using UTC)");
+        printf("\nUsage: set_tz <POSIX TZ string>\n");
+        printf("Examples:\n");
+        printf("  set_tz UTC               - UTC\n");
+        printf("  set_tz CET-1CEST,M3.5.0,M10.5.0/3  - Central Europe\n");
+        printf("  set_tz EST5EDT,M3.2.0,M11.1.0       - US Eastern\n");
+        printf("  set_tz PST8PDT,M3.2.0,M11.1.0       - US Pacific\n");
+        printf("  set_tz clear             - Clear timezone (revert to UTC)\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "clear") == 0) {
+        unsetenv("TZ");
+        tzset();
+        set_config_param_str("tz", "");
+        printf("Timezone cleared (using UTC).\n");
+        return 0;
+    }
+
+    setenv("TZ", argv[1], 1);
+    tzset();
+    set_config_param_str("tz", argv[1]);
+
+    /* Show current time to confirm */
+    time_t now = time(NULL);
+    struct tm tm_info;
+    localtime_r(&now, &tm_info);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &tm_info);
+    printf("Timezone set to: %s\n", argv[1]);
+    printf("Current time:    %s\n", buf);
+
+    return 0;
+}
+
+static void register_set_tz(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_tz",
+        .help = "Set timezone (POSIX TZ string)\n"
+                "  set_tz                   - Show current timezone\n"
+                "  set_tz <TZ string>       - Set timezone\n"
+                "  set_tz clear             - Clear timezone (revert to UTC)",
+        .hint = " <TZ string>",
+        .func = &set_tz_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+#if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32S3)
+
+/* 'set_oled' command - enable/disable OLED display */
+static int set_oled_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        bool enabled;
+        int sda, scl;
+        oled_display_get_config(&enabled, &sda, &scl);
+        printf("OLED display: %s\n", enabled ? "enabled" : "disabled");
+        printf("I2C GPIOs: SDA=%d, SCL=%d\n", sda, scl);
+        printf("\nUsage: set_oled <enable|disable>\n");
+        return 0;
+    }
+
+    const char *action = argv[1];
+    if (strcmp(action, "enable") == 0) {
+        oled_display_enable();
+        printf("OLED display will be enabled after reboot.\n");
+    } else if (strcmp(action, "disable") == 0) {
+        oled_display_disable();
+        printf("OLED display will be disabled after reboot.\n");
+    } else {
+        printf("Unknown action: %s\n", action);
+        printf("Usage: set_oled <enable|disable>\n");
+        return 1;
+    }
+
+    return 0;
+}
+
+static void register_set_oled(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_oled",
+        .help = "Enable or disable OLED display\n"
+                "  set_oled              - Show current status\n"
+                "  set_oled enable       - Enable OLED display (after reboot)\n"
+                "  set_oled disable      - Disable OLED display (after reboot)",
+        .hint = " <enable|disable>",
+        .func = &set_oled_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+/* 'set_oled_gpio' command - configure I2C pins for OLED */
+static int set_oled_gpio_cmd(int argc, char **argv)
+{
+    if (argc < 3) {
+        bool enabled;
+        int sda, scl;
+        oled_display_get_config(&enabled, &sda, &scl);
+        printf("Current OLED I2C GPIOs: SDA=%d, SCL=%d\n", sda, scl);
+        printf("\nUsage: set_oled_gpio <sda> <scl>\n");
+        return 0;
+    }
+
+    char *endptr;
+    int sda = strtol(argv[1], &endptr, 10);
+    if (*endptr != '\0' || sda < 0 || sda > 48) {
+        printf("Invalid SDA GPIO. Use 0-48.\n");
+        return 1;
+    }
+    int scl = strtol(argv[2], &endptr, 10);
+    if (*endptr != '\0' || scl < 0 || scl > 48) {
+        printf("Invalid SCL GPIO. Use 0-48.\n");
+        return 1;
+    }
+    if (sda == scl) {
+        printf("SDA and SCL must be different GPIOs.\n");
+        return 1;
+    }
+
+    oled_display_set_gpio(sda, scl);
+    printf("OLED I2C GPIOs set to SDA=%d, SCL=%d.\n", sda, scl);
+    printf("Restart the device for changes to take effect.\n");
+    return 0;
+}
+
+static void register_set_oled_gpio(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "set_oled_gpio",
+        .help = "Set I2C GPIO pins for OLED display (requires restart)",
+        .hint = " <sda> <scl>",
+        .func = &set_oled_gpio_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+
+#endif /* CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32S3 */
+
+#if !CONFIG_ETH_UPLINK
+/* Helper function to convert auth mode to string */
+static const char* auth_mode_to_str(wifi_auth_mode_t authmode)
+{
+    switch (authmode) {
+        case WIFI_AUTH_OPEN:            return "Open";
+        case WIFI_AUTH_WEP:             return "WEP";
+        case WIFI_AUTH_WPA_PSK:         return "WPA";
+        case WIFI_AUTH_WPA2_PSK:        return "WPA2";
+        case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/WPA2";
+        case WIFI_AUTH_WPA3_PSK:        return "WPA3";
+        case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/WPA3";
+        case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-Ent";
+        default:                        return "Unknown";
+    }
+}
+
+/* 'scan' command implementation */
+static int scan_cmd(int argc, char **argv)
+{
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+    };
+
+    /* Stop connection attempts so they don't interfere with scanning */
+    if (!ap_connect) {
+        wifi_scan_active = true;
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(100));  /* Let disconnect complete */
+    }
+
+    printf("Scanning for WiFi networks...\n");
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);  /* Blocking scan */
+
+    /* Read results BEFORE clearing flag or reconnecting, so nothing
+     * can interfere with the scan result buffer. */
+    uint16_t ap_count = 0;
+    wifi_ap_record_t *ap_list = NULL;
+
+    if (err == ESP_OK) {
+        esp_wifi_scan_get_ap_num(&ap_count);
+        if (ap_count > 0) {
+            ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
+            if (ap_list != NULL) {
+                esp_wifi_scan_get_ap_records(&ap_count, ap_list);
+            } else {
+                ap_count = 0;
+            }
+        }
+    }
+
+    /* Now safe to resume connection attempts */
+    wifi_scan_active = false;
+    if (!ap_connect) {
+        esp_wifi_connect();
+    }
+
+    if (err != ESP_OK) {
+        printf("Scan failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    if (ap_count == 0) {
+        printf("No networks found.\n");
+        return 0;
+    }
+
+    /* Print header */
+    printf("\nFound %d networks:\n", ap_count);
+#if WIFI_HAS_5GHZ
+    printf("%-32s  %3s  %5s  %4s  %-12s\n", "SSID", "Ch", "Band", "RSSI", "Security");
+    printf("--------------------------------  ---  -----  ----  ------------\n");
+
+    for (int i = 0; i < ap_count; i++) {
+        const char *auth = auth_mode_to_str(ap_list[i].authmode);
+        printf("%-32s  %3d  %5s  %4d  %s\n", ap_list[i].ssid, ap_list[i].primary,
+               ap_list[i].primary > 14 ? "5 GHz" : "2.4 G", ap_list[i].rssi, auth);
+    }
+#else
+    printf("%-32s  %3s  %4s  %-12s\n", "SSID", "Ch", "RSSI", "Security");
+    printf("--------------------------------  ---  ----  ------------\n");
+
+    for (int i = 0; i < ap_count; i++) {
+        const char *auth = auth_mode_to_str(ap_list[i].authmode);
+        printf("%-32s  %3d  %4d  %s\n", ap_list[i].ssid, ap_list[i].primary, ap_list[i].rssi, auth);
+    }
+#endif
+
+    free(ap_list);
+    return 0;
+}
+
+static void register_scan(void)
+{
+    const esp_console_cmd_t cmd = {
+        .command = "scan",
+        .help = "Scan for available WiFi networks",
+        .hint = NULL,
+        .func = &scan_cmd,
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}
+#endif /* !CONFIG_ETH_UPLINK */
+
+/** Arguments used by 'set_vpn' function */
+static struct {
+    struct arg_str *privkey;
+    struct arg_str *pubkey;
+    struct arg_str *endpoint;
+    struct arg_str *address;
+    struct arg_str *psk;
+    struct arg_str *mask;
+    struct arg_str *dns;
+    struct arg_int *port;
+    struct arg_int *keepalive;
+    struct arg_int *mtu;
+    struct arg_int *enable;
+    struct arg_int *killswitch;
+    struct arg_int *route_all;
+    struct arg_end *end;
+} set_vpn_args;
+
+static int set_vpn_cmd(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **) &set_vpn_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, set_vpn_args.end, argv[0]);
+        return 1;
+    }
+
+    /* Validate before writing anything so a bad value doesn't leave a partial config */
+    if (set_vpn_args.mtu->count > 0) {
+        int mtu = set_vpn_args.mtu->ival[0];
+        if (mtu < VPN_MTU_MIN || mtu > VPN_MTU_MAX) {
+            printf("MTU must be %d-%d\n", VPN_MTU_MIN, VPN_MTU_MAX);
+            return 1;
+        }
+    }
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PARAM_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        printf("Error opening NVS: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    if (set_vpn_args.privkey->count > 0) {
+        nvs_set_str(nvs, "vpn_privkey", set_vpn_args.privkey->sval[0]);
+    }
+    if (set_vpn_args.pubkey->count > 0) {
+        nvs_set_str(nvs, "vpn_pubkey", set_vpn_args.pubkey->sval[0]);
+    }
+    if (set_vpn_args.endpoint->count > 0) {
+        nvs_set_str(nvs, "vpn_endpoint", set_vpn_args.endpoint->sval[0]);
+    }
+    if (set_vpn_args.address->count > 0) {
+        nvs_set_str(nvs, "vpn_ip", set_vpn_args.address->sval[0]);
+    }
+    if (set_vpn_args.psk->count > 0) {
+        nvs_set_str(nvs, "vpn_psk", set_vpn_args.psk->sval[0]);
+    }
+    if (set_vpn_args.mask->count > 0) {
+        nvs_set_str(nvs, "vpn_mask", set_vpn_args.mask->sval[0]);
+    }
+    if (set_vpn_args.dns->count > 0) {
+        nvs_set_str(nvs, "vpn_dns", set_vpn_args.dns->sval[0]);
+    }
+    if (set_vpn_args.port->count > 0) {
+        nvs_set_i32(nvs, "vpn_port", set_vpn_args.port->ival[0]);
+    }
+    if (set_vpn_args.keepalive->count > 0) {
+        nvs_set_i32(nvs, "vpn_ka", set_vpn_args.keepalive->ival[0]);
+    }
+    if (set_vpn_args.mtu->count > 0) {
+        nvs_set_i32(nvs, "vpn_mtu", set_vpn_args.mtu->ival[0]);
+    }
+    if (set_vpn_args.enable->count > 0) {
+        nvs_set_i32(nvs, "vpn_enabled", set_vpn_args.enable->ival[0]);
+    }
+    if (set_vpn_args.killswitch->count > 0) {
+        nvs_set_i32(nvs, "vpn_ks", set_vpn_args.killswitch->ival[0]);
+    }
+    if (set_vpn_args.route_all->count > 0) {
+        nvs_set_i32(nvs, "vpn_rall", set_vpn_args.route_all->ival[0]);
+    }
+
+    nvs_commit(nvs);
+    nvs_close(nvs);
+    printf("VPN settings saved. Restart to apply.\n");
+    return 0;
+}
+
+static void register_set_vpn(void)
+{
+    set_vpn_args.privkey   = arg_str0(NULL, NULL, "<private_key>", "WireGuard private key (base64)");
+    set_vpn_args.pubkey    = arg_str0(NULL, NULL, "<public_key>", "Peer public key (base64)");
+    set_vpn_args.endpoint  = arg_str0(NULL, NULL, "<endpoint>", "Peer endpoint host/IP");
+    set_vpn_args.address   = arg_str0(NULL, NULL, "<address>", "Tunnel IP (e.g. 10.0.0.2)");
+    set_vpn_args.psk       = arg_str0("k", "psk", "<preshared_key>", "Preshared key (base64)");
+    set_vpn_args.mask      = arg_str0("m", "mask", "<netmask>", "Tunnel netmask (default 255.255.255.0)");
+    set_vpn_args.dns       = arg_str0("d", "dns", "<dns_ip>", "DNS server for AP clients while VPN is up");
+    set_vpn_args.port      = arg_int0("p", "port", "<port>", "Peer UDP port (default 51820)");
+    set_vpn_args.keepalive = arg_int0("a", "keepalive", "<seconds>", "Persistent keepalive (0=disabled)");
+    set_vpn_args.mtu       = arg_int0("M", "mtu", "<1280-1420>", "Tunnel MTU (default 1420; lower for CGNAT/PPPoE/LTE)");
+    set_vpn_args.enable    = arg_int0("e", "enable", "<0|1>", "Enable/disable VPN");
+    set_vpn_args.killswitch = arg_int0("K", "killswitch", "<0|1>", "Kill switch: block internet when VPN down (default on)");
+    set_vpn_args.route_all = arg_int0("R", "route-all", "<0|1>", "Route all traffic through VPN (0=split tunnel)");
+    set_vpn_args.end       = arg_end(4);
+
+    const esp_console_cmd_t cmd = {
+        .command = "set_vpn",
+        .help = "Configure WireGuard VPN (restart to apply)",
+        .hint = NULL,
+        .func = &set_vpn_cmd,
+        .argtable = &set_vpn_args
+    };
+    ESP_ERROR_CHECK( esp_console_cmd_register(&cmd) );
+}

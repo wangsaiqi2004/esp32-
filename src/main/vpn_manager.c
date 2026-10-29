@@ -1,0 +1,230 @@
+/* WireGuard VPN management.
+ *
+ * Handles VPN connection/disconnection, SNTP time sync (required for
+ * WireGuard timestamps), and VPN subnet helpers for the kill switch.
+ */
+
+#include <string.h>
+#include <time.h>
+#include "esp_log.h"
+#include "esp_wireguard.h"
+#include "esp_sntp.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "lwip/ip_addr.h"
+#include "vpn_config.h"
+#include "router_config.h"
+#include "portmap.h"
+
+static const char *TAG = "vpn_mgr";
+
+// Cached VPN subnet for kill switch (network byte order)
+static uint32_t vpn_subnet_ip = 0;
+static uint32_t vpn_subnet_mask = 0;
+
+// WireGuard context (module-private)
+static wireguard_config_t wg_config = ESP_WIREGUARD_CONFIG_DEFAULT();
+static wireguard_ctx_t wg_ctx = {0};
+static bool wg_initialized = false;
+
+void vpn_set_subnet(uint32_t ip, uint32_t mask) {
+    vpn_subnet_ip = ip;
+    vpn_subnet_mask = mask;
+}
+
+IRAM_ATTR bool vpn_in_subnet(uint32_t ip) {
+    if (vpn_subnet_mask == 0) return false;
+    return (ip & vpn_subnet_mask) == vpn_subnet_ip;
+}
+
+esp_err_t vpn_connect(void)
+{
+    if (!vpn_enabled) {
+        ESP_LOGI(TAG, "VPN not enabled");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (vpn_private_key == NULL || strlen(vpn_private_key) == 0 ||
+        vpn_public_key == NULL || strlen(vpn_public_key) == 0 ||
+        vpn_endpoint == NULL || strlen(vpn_endpoint) == 0 ||
+        vpn_address == NULL || strlen(vpn_address) == 0) {
+        ESP_LOGE(TAG, "VPN missing required config (privkey, pubkey, endpoint, address)");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    wg_config.private_key = vpn_private_key;
+    wg_config.public_key = vpn_public_key;
+    wg_config.preshared_key = (vpn_preshared_key && strlen(vpn_preshared_key) > 0) ? vpn_preshared_key : NULL;
+    wg_config.allowed_ip = vpn_address;
+    wg_config.allowed_ip_mask = (vpn_netmask && strlen(vpn_netmask) > 0) ? vpn_netmask : "255.255.255.0";
+    wg_config.endpoint = vpn_endpoint;
+    wg_config.port = vpn_port;
+    wg_config.persistent_keepalive = vpn_keepalive;
+#if CONFIG_ETH_UPLINK
+    wg_config.netif_key = "ETH_DEF";
+#endif
+
+    esp_err_t err;
+    if (!wg_initialized) {
+        err = esp_wireguard_init(&wg_config, &wg_ctx);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "WireGuard init failed: %s", esp_err_to_name(err));
+            return err;
+        }
+        wg_initialized = true;
+    }
+
+    err = esp_wireguard_connect(&wg_ctx);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WireGuard connect failed: %s", esp_err_to_name(err));
+        // Reset so next attempt does a clean init (avoids leaked netif/timers)
+        wg_initialized = false;
+        memset(&wg_ctx, 0, sizeof(wg_ctx));
+        return err;
+    }
+
+    if (vpn_route_all) {
+        err = esp_wireguard_set_default(&wg_ctx);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "WireGuard set_default failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    /* Match the tunnel netif MTU to the configured value so lwIP fragments
+     * non-DF inner packets (plain UDP) before encryption; the outer WG packet
+     * is then at most vpn_mtu + 60 (IPv4) and fits a reduced uplink path MTU.
+     * PMTU/MSS cover DF and TCP traffic from AP clients. */
+    if (wg_ctx.netif) {
+        wg_ctx.netif->mtu = (u16_t)vpn_mtu;
+    }
+    ap_mss_clamp = (uint16_t)(vpn_mtu - 40);
+    ap_pmtu = (uint16_t)vpn_mtu;
+    vpn_connected = true;
+
+    /* Cache VPN tunnel IP and activate VPN-bound port mappings */
+    if (wg_ctx.netif) {
+        vpn_tunnel_ip = ip_2_ip4(&wg_ctx.netif->ip_addr)->addr;
+    }
+    delete_portmap_tab();
+    apply_portmap_tab();
+
+    ESP_LOGI(TAG, "WireGuard VPN connected%s, MTU=%u MSS=%u PMTU=%u",
+             vpn_route_all ? "" : " (split tunnel)",
+             (unsigned)vpn_mtu, ap_mss_clamp, ap_pmtu);
+    return ESP_OK;
+}
+
+void vpn_reassert_default_route(void)
+{
+    /* ESP-IDF's esp_netif owns lwIP's netif_default and recomputes it from
+     * route_prio on every uplink GOT_IP (initial association AND periodic DHCP
+     * renewals) and on interface up/down events. esp_wireguard_set_default()
+     * uses raw netif_set_default(), which esp_netif does not track, so the WG
+     * tunnel silently loses the default route to the uplink and route-all
+     * traffic leaks straight out the uplink. Re-assert the tunnel as default
+     * whenever one of those events fires while the VPN is up in route-all mode.
+     *
+     * Safe to call from event-handler context: WireGuard's own encrypted
+     * packets are sent via udp_sendto_if(underlying_netif) and never use the
+     * default route, so this only redirects the forwarded inner traffic. */
+    if (vpn_enabled && vpn_route_all && wg_initialized && wg_ctx.netif && vpn_connected) {
+        esp_wireguard_set_default(&wg_ctx);
+    }
+}
+
+void vpn_disconnect(void)
+{
+    // Set vpn_connected false FIRST to prevent race with vpn_is_connected()
+    // (called from netif hooks and HTTP handlers in other tasks)
+    vpn_connected = false;
+    vpn_tunnel_ip = 0;
+    ap_mss_clamp = 0;
+    ap_pmtu = 0;
+
+    /* Deactivate VPN portmaps, keep STA ones */
+    delete_portmap_tab();
+    apply_portmap_tab();
+
+    if (wg_initialized) {
+        esp_wireguard_disconnect(&wg_ctx);
+        wg_initialized = false;
+    }
+    ESP_LOGI(TAG, "WireGuard VPN disconnected, MSS/PMTU disabled");
+}
+
+IRAM_ATTR bool vpn_is_connected(void)
+{
+    if (!wg_initialized || !vpn_connected || !wg_ctx.netif) {
+        return false;
+    }
+    return esp_wireguardif_peer_is_up(&wg_ctx) == ESP_OK;
+}
+
+static void init_sntp(void)
+{
+    ESP_LOGI(TAG, "Initializing SNTP");
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.nist.gov");
+    esp_sntp_setservername(2, "time.google.com");
+    esp_sntp_init();
+}
+
+/* Guards against a second connect task while one is still waiting for SNTP:
+ * every uplink GOT_IP would otherwise spawn another 4 KB task that sits for up
+ * to 30 s and then races the others inside vpn_connect() over wg_ctx. */
+static volatile bool vpn_connect_pending = false;
+
+bool vpn_connect_task_start(void)
+{
+    if (vpn_connect_pending) {
+        ESP_LOGI(TAG, "VPN connect already pending, skipping");
+        return false;
+    }
+    vpn_connect_pending = true;
+    if (xTaskCreate(vpn_connect_task, "vpn_connect", 4096, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create VPN connect task");
+        vpn_connect_pending = false;
+        return false;
+    }
+    return true;
+}
+
+void vpn_connect_task(void *pvParameters)
+{
+    // Wait for SNTP time sync before connecting VPN
+    // WireGuard uses TAI64N timestamps - needs valid wall clock after reboot
+    int retry = 0;
+    const int max_retry = 60;  // 30 seconds max
+    time_t now = 0;
+    while (retry < max_retry) {
+        time(&now);
+        // Consider time valid if after 2020-01-01
+        if (now > 1577836800) {
+            break;
+        }
+        if (retry % 4 == 0) {
+            ESP_LOGI(TAG, "Waiting for SNTP time sync... (%d/%ds)", retry / 2, max_retry / 2);
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+        retry++;
+    }
+    if (now > 1577836800) {
+        struct tm timeinfo;
+        localtime_r(&now, &timeinfo);
+        ESP_LOGI(TAG, "Time synchronized: %04d-%02d-%02d %02d:%02d:%02d",
+                 timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                 timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    } else {
+        ESP_LOGW(TAG, "SNTP sync timeout after %ds, proceeding with VPN anyway", max_retry / 2);
+    }
+    vpn_connect();
+    vpn_connect_pending = false;
+    vTaskDelete(NULL);
+}
+
+void init_sntp_if_needed(void)
+{
+    if (!esp_sntp_enabled()) {
+        init_sntp();
+    }
+}
